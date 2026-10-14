@@ -1146,6 +1146,39 @@ ${CONFIG("Main")}`;
     expect(located(after, 1).length).toBe(located(before, 1).length + 1);
   });
 
+  it("gives each statement of a multi-statement line its own range in lineMap and statements (A015, D8)", () => {
+    const r = compile(A + B, { fileName: "ab.st" });
+    expect(r.errors).toEqual([]);
+    const lines = (A + B).split("\n");
+    const line = lines.findIndex((l) => l.includes("n := Inc(n)")) + 1;
+    const text = lines[line - 1]!;
+    const onLine = r.statements!.filter((s) => s.line === line);
+    expect(
+      onLine.map((s) => text.slice(s.col - 1, s.endCol)),
+    ).toEqual(["n := Inc(n);", "k := h.Twice();"]);
+    const info = r.debugInfo!;
+    for (const s of r.statements!) {
+      expect(s).toMatchObject({
+        file: "ab.st",
+        line: info.probes.line[s.probeId],
+        col: info.probes.col[s.probeId],
+        endLine: info.probes.endLine[s.probeId],
+        endCol: info.probes.endCol[s.probeId],
+      });
+      expect(s.cppStartLine).toBeLessThanOrEqual(s.cppEndLine);
+    }
+    expect(new Set(r.statements!.map((s) => s.probeId)).size).toBe(
+      info.probes.line.length,
+    );
+    expect(r.lineMap.get(line)).toMatchObject({
+      file: "ab.st",
+      stCol: onLine[0]!.col,
+      stEndLine: onLine[0]!.endLine,
+      stEndCol: onLine[0]!.endCol,
+      probeIds: onLine.map((s) => s.probeId),
+    });
+  });
+
   it("gives loops a condition probe and never moves a breakpoint across a POU edge", () => {
     const info = build(A, B);
     const line = (file: string, text: string): number =>

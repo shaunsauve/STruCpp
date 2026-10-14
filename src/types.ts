@@ -200,6 +200,32 @@ export interface LineMapEntry {
 
   /** Probe IDs starting on this ST line, in emission order (`debug-info.json` `probes`). */
   probeIds?: number[];
+
+  /** Source file of the line's first statement. The key is still the line alone. */
+  file?: string;
+
+  /** Start column and end of the line's first statement (1-indexed, inclusive). */
+  stCol?: number;
+  stEndLine?: number;
+  stEndCol?: number;
+}
+
+/**
+ * One executable statement: its probe, ST range and C++ line range. The
+ * source of `debug-info.json` `probes`, one record per probe ID.
+ */
+export interface StatementMapEntry {
+  probeId: number;
+  file: string;
+  line: number;
+  col: number;
+  endLine: number;
+  endCol: number;
+  /** 0 statement, 1 loop condition, 2 ELSIF condition. */
+  kind: number;
+  /** C++ lines in the concatenated `cppCode`, as `lineMap`. */
+  cppStartLine: number;
+  cppEndLine: number;
 }
 
 /**
@@ -251,6 +277,9 @@ export interface CompileResult {
 
   /** Line mapping from ST line numbers to C++ header line ranges */
   headerLineMap: Map<number, LineMapEntry>;
+
+  /** One record per probe ID, in probe order; absent when compilation failed. */
+  statements?: StatementMapEntry[];
 
   /** Compilation errors */
   errors: CompileError[];

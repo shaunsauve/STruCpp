@@ -929,6 +929,7 @@ export function compile(
     headerCode: codeResult.headerCode,
     lineMap: codeResult.lineMap,
     headerLineMap: codeResult.headerLineMap,
+    statements: codeResult.statements,
     errors: pipeline.errors,
     warnings: pipeline.warnings,
     ast: pipeline.ast,
@@ -1060,7 +1061,12 @@ export type {
   CompileError,
   AnalysisResult,
 } from "./types.js";
-export type { SourceSpan, LineMapEntry, Severity } from "./types.js";
+export type {
+  SourceSpan,
+  LineMapEntry,
+  StatementMapEntry,
+  Severity,
+} from "./types.js";
 
 // Re-export diagnostic formatting helpers
 export {

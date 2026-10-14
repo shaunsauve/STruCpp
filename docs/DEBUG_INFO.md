@@ -153,7 +153,11 @@ renumbers every later probe. A client holding breakpoints across a rebuild re-re
 locations of its statements.
 
 `compile()` also records each probe ID in `CompileResult.lineMap`, under the ST line where the
-probe starts (`probeIds`), from the same numbering.
+probe starts (`probeIds`), from the same numbering. The entry also carries the `file`, `stCol`,
+`stEndLine` and `stEndCol` of that line's first statement; the map stays keyed on the line alone.
+`CompileResult.statements` holds one record per probe ID, in probe order: its file, ST range,
+kind and C++ line range in the concatenated `cppCode`. Codegen records both where it emits the
+statement, so a line with several statements has one record per statement.
 
 ## `lines`
 

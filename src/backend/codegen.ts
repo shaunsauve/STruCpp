@@ -38,7 +38,7 @@ import type {
   Visibility,
 } from "../frontend/ast.js";
 import type { SymbolTables } from "../semantic/symbol-table.js";
-import type { LineMapEntry } from "../types.js";
+import type { LineMapEntry, StatementMapEntry } from "../types.js";
 import type { ProbeKind, ProbePlan } from "./probe-plan.js";
 import { walkAST } from "../ast-utils.js";
 import { StdFunctionRegistry } from "../semantic/std-function-registry.js";
@@ -464,6 +464,9 @@ export interface CodeGenResult {
   /** Line mapping from ST to C++ header lines */
   headerLineMap: Map<number, LineMapEntry>;
 
+  /** One record per emitted probe, in probe order. */
+  statements: StatementMapEntry[];
+
   /** Warnings emitted during code generation */
   warnings: Array<{
     message: string;
@@ -498,6 +501,7 @@ export class CodeGenerator {
 
   private headerOutput: string[] = [];
   private lineMap: Map<number, LineMapEntry> = new Map();
+  private statements: Map<number, StatementMapEntry> = new Map();
   private headerLineMap: Map<number, LineMapEntry> = new Map();
   private currentHeaderLine = 1;
   private projectModel?: ProjectModel;
@@ -1141,6 +1145,7 @@ export class CodeGenerator {
     this.output = [];
     this.headerOutput = [];
     this.lineMap = new Map();
+    this.statements = new Map();
     this.headerLineMap = new Map();
     this.currentLine = 1;
     this.currentHeaderLine = 1;
@@ -1270,6 +1275,9 @@ export class CodeGenerator {
       headerCode: this.headerOutput.join(eol),
       lineMap: this.lineMap,
       headerLineMap: this.headerLineMap,
+      statements: [...this.statements.values()].sort(
+        (a, b) => a.probeId - b.probeId,
+      ),
       warnings: this.codegenWarnings,
     };
   }
@@ -7397,7 +7405,8 @@ export class CodeGenerator {
       });
       return;
     }
-    const stLine = this.probePlan.probes[id]!.line;
+    const probe = this.probePlan.probes[id]!;
+    const stLine = probe.line;
     let entry = this.lineMap.get(stLine);
     if (entry === undefined) {
       entry = { cppStartLine: cppLine, cppEndLine: this.currentLine - 1 };
@@ -7405,6 +7414,26 @@ export class CodeGenerator {
     }
     const ids = (entry.probeIds ??= []);
     if (!ids.includes(id)) ids.push(id);
+    // The line's first statement by column gives the entry its range.
+    if (entry.stCol === undefined || probe.col < entry.stCol) {
+      entry.file = probe.file;
+      entry.stCol = probe.col;
+      entry.stEndLine = probe.endLine;
+      entry.stEndCol = probe.endCol;
+    }
+    if (!this.statements.has(id)) {
+      this.statements.set(id, {
+        probeId: id,
+        file: probe.file,
+        line: probe.line,
+        col: probe.col,
+        endLine: probe.endLine,
+        endCol: probe.endCol,
+        kind: probe.kind,
+        cppStartLine: cppLine,
+        cppEndLine: Math.max(cppLine, this.currentLine - 1),
+      });
+    }
   }
 
   private recordHeaderLineMapping(
