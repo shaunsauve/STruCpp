@@ -551,6 +551,14 @@ int main() {
     expect(init.errors.map((e) => e.message)).toEqual([
       "UNION 'U2' member 'W' cannot have an initial value",
     ]);
+    const fbMember = compile(
+      "TYPE U3 : UNION t : TON; b : BYTE; END_UNION; END_TYPE\n" +
+        `PROGRAM Main VAR u : U3; END_VAR END_PROGRAM${CFG}`,
+      { libraries: discoverStlibs(path.resolve(__dirname, "../../libs")) },
+    );
+    expect(fbMember.errors.map((e) => e.message)).toEqual([
+      "UNION 'U3' member 'T' cannot be a function block instance",
+    ]);
   });
 
   it("addresses the same value handle_read copies, force included, and exports the build id", () => {

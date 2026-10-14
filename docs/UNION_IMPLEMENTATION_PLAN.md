@@ -1,6 +1,12 @@
 # UNION Implementation Plan
 
-Status: **Proposed** — Phase 6 (CODESYS compatibility)
+Status: **Implemented**, with these differences from the plan: a UNION is a
+`StructDefinition` with `isUnion` rather than a separate `UnionDefinition`
+node, so every struct path applies unchanged; members keep their IECVar
+wrappers, so the generated union has a zero-filling constructor and a
+byte-copying copy and assignment; and an array or struct member overlays a
+scalar member at its first element only (`docs/IEC_COMPLIANCE.md`).
+Initial values, FB instances and REFERENCE TO members are refused.
 Owner: TBD
 Last updated: 2026-04-30
 

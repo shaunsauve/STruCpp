@@ -921,14 +921,17 @@ export class SemanticAnalyzer {
     for (const typeDecl of ast.types) {
       if (typeDecl.definition.kind !== "StructDefinition") continue;
       for (const field of typeDecl.definition.fields) {
-        if (typeDecl.definition.isUnion && field.initialValue) {
-          this.addError(
-            `UNION '${typeDecl.name}' member '${field.names.join(", ")}' cannot have an initial value`,
-            field.sourceSpan.startLine,
-            field.sourceSpan.startCol,
-            field.sourceSpan.file,
-          );
-          continue;
+        if (typeDecl.definition.isUnion) {
+          const problem = this.unionMemberProblem(field);
+          if (problem !== undefined) {
+            this.addError(
+              `UNION '${typeDecl.name}' member '${field.names.join(", ")}' ${problem}`,
+              field.sourceSpan.startLine,
+              field.sourceSpan.startCol,
+              field.sourceSpan.file,
+            );
+            continue;
+          }
         }
         this.checkDeclarationInitializer(field, ast);
       }
@@ -951,6 +954,22 @@ export class SemanticAnalyzer {
         checkPou([...fb.varBlocks, ...method.varBlocks], [method.body]);
       }
     }
+  }
+
+  /**
+   * Why a UNION member is refused: union storage is zero-filled and copied
+   * byte-wise, which an FB instance or a REFERENCE TO cannot survive.
+   */
+  private unionMemberProblem(field: VarDeclaration): string | undefined {
+    if (field.initialValue) return "cannot have an initial value";
+    if (field.type.referenceKind === "reference_to") {
+      return "cannot be a REFERENCE TO";
+    }
+    const name = (field.type.elementTypeName ?? field.type.name).toUpperCase();
+    if (this.symbolTables.lookupFunctionBlock(name)) {
+      return "cannot be a function block instance";
+    }
+    return undefined;
   }
 
   /** Check every declaration in a VAR block. */
