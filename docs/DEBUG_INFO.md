@@ -149,15 +149,16 @@ A library function block is a black box: its members are its interface (`VAR_INP
 ## `instances`
 
 Columnar: index `i` of every array describes one instance. Program instances come first, each
-followed depth-first by the function-block instances it contains (members, array elements, and
-fields of structs).
+followed depth-first by the function-block instances it contains (members, inherited members,
+array elements, and fields of structs), then global function-block instances. `VAR_IN_OUT`
+members refer to an instance owned elsewhere and are not walked.
 
 | Field | Meaning |
 |---|---|
 | `path` | Instance path, as in `debug-map.json` leaf paths: `PROG0`, `PROG0.MOTOR1.PID`, `PROG0.AXES[2]`. Global FB instances use the bare global name. |
 | `typeId` | `types[].id` of the instance's type. |
 | `leafBase` | Index in `debug-map.json` `leaves` of the instance's first leaf, or `null` if it has none. A member's leaf is `leafBase` plus its ordinal in the type's leaf order. |
-| `leafBaseExt` | First leaf of the instance's sections that `debug-map.json` does not yet cover, appended after every existing leaf (ADR-002 D3 second pass). `null` until that pass exists. |
+| `leafBaseExt` | First leaf of the instance's sections that `debug-map.json` does not yet cover, appended after every existing leaf (the second leaf pass). `null` until that pass exists. |
 
 ## `globals`
 

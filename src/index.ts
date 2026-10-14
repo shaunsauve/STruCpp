@@ -25,6 +25,10 @@ import {
   generateDebugTable,
   type DebugMapV2,
 } from "./backend/debug-table-gen.js";
+import {
+  generateDebugInfo,
+  type DebugInfoV1,
+} from "./backend/debug-info-gen.js";
 import { StdFunctionRegistry } from "./semantic/std-function-registry.js";
 import type {
   CompilationUnit,
@@ -811,6 +815,7 @@ export function compile(
   // return the primary compile output; the debug artifacts are just omitted.
   let debugTableCpp: string | undefined;
   let debugMap: DebugMapV2 | undefined;
+  let debugInfo: DebugInfoV1 | undefined;
   if (pipeline.projectModel && pipeline.symbolTables) {
     const dbg = generateDebugTable(
       pipeline.ast,
@@ -820,6 +825,27 @@ export function compile(
     );
     debugTableCpp = dbg.debugTableCpp;
     debugMap = dbg.debugMap;
+    const opts = pipeline.mergedOptions;
+    debugInfo = generateDebugInfo({
+      ast: pipeline.ast,
+      projectModel: pipeline.projectModel,
+      symbolTables: pipeline.symbolTables,
+      leafPaths: dbg.debugMap.leaves.map((l) => l.path),
+      sources: [
+        { fileName: opts.fileName ?? "main.st", source },
+        ...(opts.additionalSources ?? []),
+      ],
+      libraries: pipeline.allArchives,
+      md5: opts.md5 ?? "",
+      compilerVersion: getVersion(),
+      options: {
+        isTestBuild: opts.isTestBuild ?? false,
+        globalConstants: opts.globalConstants ?? {},
+      },
+      ...(opts.globalConstants
+        ? { globalConstants: opts.globalConstants }
+        : {}),
+    });
 
     // A RETAIN the walk could not follow all the way down is a WARNING, not an
     // error. The program still builds and its visible surface is still
@@ -870,6 +896,7 @@ export function compile(
       : {}),
     ...(debugTableCpp !== undefined ? { debugTableCpp } : {}),
     ...(debugMap !== undefined ? { debugMap } : {}),
+    ...(debugInfo !== undefined ? { debugInfo } : {}),
   };
 }
 

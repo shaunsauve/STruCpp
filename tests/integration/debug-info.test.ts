@@ -1,5 +1,5 @@
 /**
- * debug-info.json (ADR-002 D3): every corpus build validates against the
+ * debug-info.json: every corpus build validates against the
  * published schema, every declared variable is described in its scope with
  * its IEC type, and rich types carry their bounds, lengths and targets.
  *
@@ -41,8 +41,7 @@ if (!corpusPresent && CORPUS_ENV === undefined) {
 
 /** Corpus programs STruCpp cannot compile yet, with the reason. */
 const EXPECTED_FAIL: Record<string, string> = {
-  "generated-region":
-    "the {strucpp generated} pragmas are not lexed yet (ADR-002 D6)",
+  "generated-region": "the {strucpp generated} pragmas are not lexed yet",
   "iec-display": "a variable named `by` is lexed as the BY keyword",
   "multi-task":
     "codegen refuses a shared function-block global called from a program",
@@ -167,7 +166,7 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
       expect(schemaErrors(JSON.stringify(json))).not.toEqual([]);
     });
 
-    it("keeps the largest corpus program's debug-info within ADR-002 D9 (A021)", () => {
+    it("keeps the largest corpus program's debug-info under 1.5 MB (A021)", () => {
       const [b] = corpusBuilds("large-50k");
       expect(b!.info, "large-50k: no debugInfo").toBeDefined();
       const bytes = new TextEncoder().encode(serializeDebugInfo(b!.info!));

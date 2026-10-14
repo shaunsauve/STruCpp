@@ -1,13 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2025 Autonomy / OpenPLC Project
 /**
- * STruC++ debug-info generator: `debug-info.json`, major 1 (ADR-002 D3).
+ * STruC++ debug-info generator: `debug-info.json`, format major 1.
  *
  * See also:
  *   src/backend/debug-table-gen.ts - DebugMapV2 leaves, which instances and globals address.
  *   docs/debug-info.schema.json - the published schema for this file.
  *   docs/DEBUG_INFO.md - prose description of every field.
+ *   src/backend/sha256.ts - file hashes and the build identity.
  */
+
+import type {
+  CompilationUnit,
+  ReferenceKind,
+  TypeReference,
+  VarBlock,
+  VarDeclaration,
+} from "../frontend/ast.js";
+import type { ProjectModel } from "../project-model.js";
+import type { SymbolTables } from "../semantic/symbol-table.js";
+import type { StlibArchive } from "../library/library-manifest.js";
+import { isElementaryType } from "../semantic/type-registry.js";
+import { evalIntConst, MAX_TYPE_ALIAS_DEPTH } from "../semantic/type-utils.js";
+import { sha256Hex } from "./sha256.js";
 
 export const DEBUG_INFO_FORMAT = "strucpp-debug-info";
 export const DEBUG_INFO_MAJOR = 1;
@@ -58,7 +73,7 @@ export interface DebugLocal {
   typeId: number;
   /** IEC var block: VAR, VAR_INPUT, VAR_OUTPUT, VAR_IN_OUT, VAR_TEMP, VAR_INST. */
   kind: string;
-  /** Index into the POU's `__dbg_locals` offset table; null until probes exist (ADR-001 D3). */
+  /** Index into the POU's `__dbg_locals` offset table; null until probe builds emit it. */
   localsSlot: number | null;
 }
 
@@ -132,20 +147,644 @@ export interface DebugInfoV1 {
   formats: unknown[];
 }
 
-/**
- * Serialise with object keys sorted at every level and no whitespace, so equal
- * inputs give byte-identical files on every build path (ADR-002 D7).
- */
-export function serializeDebugInfo(info: DebugInfoV1): string {
-  return JSON.stringify(info, (_key, value: unknown) => {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) {
-      return value;
-    }
-    const obj = value as Record<string, unknown>;
+/** JSON with object keys sorted at every level and no whitespace. */
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) => {
+    if (v === null || typeof v !== "object" || Array.isArray(v)) return v;
+    const obj = v as Record<string, unknown>;
     return Object.fromEntries(
       Object.keys(obj)
         .sort()
         .map((k) => [k, obj[k]]),
     );
   });
+}
+
+/**
+ * Serialise with sorted keys, so equal inputs give byte-identical files on
+ * every build path.
+ */
+export function serializeDebugInfo(info: DebugInfoV1): string {
+  return canonicalJson(info);
+}
+
+// ---------------------------------------------------------------------------
+// Generator
+// ---------------------------------------------------------------------------
+
+export interface DebugInfoInput {
+  ast: CompilationUnit;
+  projectModel: ProjectModel;
+  symbolTables: SymbolTables;
+  /** `debug-map.json` leaf paths, in leaf order. */
+  leafPaths: string[];
+  /** User sources in compile order, as given to the compiler. */
+  sources: Array<{ fileName: string; source: string }>;
+  libraries: StlibArchive[];
+  /** Program identity as served on 0x45; empty when the caller gave none. */
+  md5: string;
+  compilerVersion: string;
+  /** Compile options that change generated code. */
+  options: Record<string, unknown>;
+  globalConstants?: Record<string, number>;
+}
+
+/** Var blocks stored in a program or FB instance; VAR_TEMP is frame storage, VAR_EXTERNAL a global. */
+const INSTANCE_SECTIONS = new Set([
+  "VAR",
+  "VAR_INPUT",
+  "VAR_OUTPUT",
+  "VAR_IN_OUT",
+]);
+
+/** Capacity of an undeclared STRING / WSTRING, as codegen emits it. */
+const DEFAULT_STRING_LENGTH = 254;
+
+const archiveHashes = new WeakMap<StlibArchive, string>();
+
+/** Content hash of a library archive, memoised: the same archive object is reused across compiles. */
+function archiveHash(archive: StlibArchive): string {
+  let hash = archiveHashes.get(archive);
+  if (hash === undefined) {
+    hash = sha256Hex(JSON.stringify(archive));
+    archiveHashes.set(archive, hash);
+  }
+  return hash;
+}
+
+/** Index of the first leaf under every path prefix (instance, member or global). */
+function firstLeafByPrefix(leafPaths: string[]): Map<string, number> {
+  const first = new Map<string, number>();
+  leafPaths.forEach((path, index) => {
+    for (let i = 1; i < path.length; i++) {
+      const ch = path[i];
+      if (ch !== "." && ch !== "[") continue;
+      const prefix = path.slice(0, i);
+      if (!first.has(prefix)) first.set(prefix, index);
+    }
+    if (!first.has(path)) first.set(path, index);
+  });
+  return first;
+}
+
+export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
+  const { ast, projectModel, symbolTables } = input;
+
+  const files: DebugFile[] = input.sources.map((s, id) => ({
+    id,
+    path: s.fileName,
+    sha256: sha256Hex(s.source),
+    library: null,
+    generated: false,
+  }));
+  const fileIdByName = new Map(files.map((f) => [f.path, f.id]));
+
+  // --- Types ----------------------------------------------------------------
+
+  const types: DebugType[] = [];
+  const typeIdByKey = new Map<string, number>();
+  const programByName = new Map(
+    ast.programs.map((p) => [p.name.toUpperCase(), p]),
+  );
+  const interfaceNames = new Set(
+    ast.interfaces.map((i) => i.name.toUpperCase()),
+  );
+  const libraryFbTypes: Array<{ name: string; typeId: number }> = [];
+  const resolvingAliases = new Set<string>();
+
+  /** Reserves the id before describing, so a type can reach itself through a reference. */
+  const intern = (key: string, describe: (id: number) => DebugType): number => {
+    const known = typeIdByKey.get(key);
+    if (known !== undefined) return known;
+    const id = types.length;
+    typeIdByKey.set(key, id);
+    types.push({ id, kind: "elementary", name: null });
+    types[id] = describe(id);
+    return id;
+  };
+
+  const stringType = (wide: boolean, length: number): number => {
+    const base = wide ? "WSTRING" : "STRING";
+    const name = length === DEFAULT_STRING_LENGTH ? base : `${base}(${length})`;
+    return intern(`string:${name}`, (id) => ({
+      id,
+      kind: "string",
+      name,
+      length,
+      wide,
+    }));
+  };
+
+  const stringLength = (maxLength: number | string | undefined): number => {
+    if (typeof maxLength === "number") return maxLength;
+    if (typeof maxLength === "string") {
+      const c = input.globalConstants ?? {};
+      return (
+        c[maxLength] ?? c[maxLength.toUpperCase()] ?? DEFAULT_STRING_LENGTH
+      );
+    }
+    return DEFAULT_STRING_LENGTH;
+  };
+
+  /** Wraps `targetId` in reference levels, outermost first. */
+  const refType = (chain: ReferenceKind[], targetId: number): number => {
+    let id = targetId;
+    for (const refKind of [...chain].reverse()) {
+      if (refKind === "none") continue;
+      const target = id;
+      id = intern(`ref:${refKind}:${target}`, (rid) => ({
+        id: rid,
+        kind: "ref",
+        name: null,
+        target,
+        refKind,
+      }));
+    }
+    return id;
+  };
+
+  const arrayType = (
+    name: string | null,
+    dims: Array<[number, number] | null>,
+    elemOf: () => number,
+  ): number => {
+    const describe = (id: number): DebugType => ({
+      id,
+      kind: "array",
+      name,
+      dims,
+      elem: elemOf(),
+    });
+    if (name !== null) return intern(`name:${name}`, describe);
+    // Anonymous arrays are keyed by shape; the element id is needed first.
+    const elem = elemOf();
+    return intern(`array:${JSON.stringify(dims)}:${elem}`, (id) => ({
+      id,
+      kind: "array",
+      name: null,
+      dims,
+      elem,
+    }));
+  };
+
+  const membersOf = (
+    decls: VarDeclaration[],
+    section: string | null,
+  ): DebugMember[] =>
+    decls.flatMap((decl) => {
+      const typeId = typeOf(decl.type);
+      return decl.names.map((name) => ({
+        name,
+        typeId,
+        section,
+        location: decl.address ?? null,
+        format: null,
+      }));
+    });
+
+  const instanceMembers = (blocks: VarBlock[]): DebugMember[] =>
+    blocks
+      .filter((b) => INSTANCE_SECTIONS.has(b.blockType))
+      .flatMap((b) => membersOf(b.declarations, b.blockType));
+
+  const typeOf = (tr: TypeReference): number => {
+    const chain = (tr.referenceChain ?? [tr.referenceKind]).filter(
+      (k) => k !== "none",
+    );
+    if (chain.length > 0) {
+      const base: TypeReference = {
+        ...tr,
+        referenceKind: "none",
+        isReference: false,
+      };
+      delete base.referenceChain;
+      return refType(chain, typeOf(base));
+    }
+    if (tr.arrayDimensions && tr.elementTypeName !== undefined) {
+      const elementName = tr.elementTypeName.toUpperCase();
+      const elementChain = tr.elementReferenceChain ?? [];
+      return arrayType(
+        null,
+        tr.arrayDimensions.map((d) => [d.start, d.end]),
+        () => refType(elementChain, namedType(elementName)),
+      );
+    }
+    const name = tr.name.toUpperCase();
+    if (name === "STRING" || name === "WSTRING") {
+      return stringType(name === "WSTRING", stringLength(tr.maxLength));
+    }
+    return namedType(name);
+  };
+
+  const namedType = (name: string): number => {
+    const key = `name:${name}`;
+    const known = typeIdByKey.get(key);
+    if (known !== undefined) return known;
+    if (name === "STRING" || name === "WSTRING") {
+      return stringType(name === "WSTRING", DEFAULT_STRING_LENGTH);
+    }
+    if (isElementaryType(name)) {
+      return intern(key, (id) => ({ id, kind: "elementary", name }));
+    }
+
+    const ts = symbolTables.lookupType(name);
+    if (ts) {
+      const def = ts.declaration.definition;
+      const declaredName = ts.declaration.inline ? null : name;
+      switch (def.kind) {
+        case "StructDefinition":
+          return intern(key, (id) => ({
+            id,
+            kind: "struct",
+            name,
+            members: membersOf(def.fields, null),
+          }));
+        case "EnumDefinition":
+          return intern(key, (id) => {
+            let next = 0;
+            const values = def.members.map((m): [string, number] => {
+              const v =
+                m.value !== undefined ? (evalIntConst(m.value) ?? next) : next;
+              next = v + 1;
+              return [m.name, v];
+            });
+            return {
+              id,
+              kind: "enum",
+              name: declaredName,
+              values,
+              base: def.baseType ? typeOf(def.baseType) : namedType("INT"),
+            };
+          });
+        case "SubrangeDefinition": {
+          const low = evalIntConst(def.lowerBound);
+          const high = evalIntConst(def.upperBound);
+          if (low === undefined || high === undefined) {
+            return aliasOf(key, name, () => typeOf(def.baseType));
+          }
+          return intern(key, (id) => ({
+            id,
+            kind: "subrange",
+            name: declaredName,
+            base: typeOf(def.baseType),
+            range: [low, high],
+          }));
+        }
+        case "ArrayDefinition":
+          return arrayType(
+            name,
+            def.dimensions.map((d) => {
+              const lo = d.isVariableLength ? undefined : evalIntConst(d.start);
+              const hi = d.isVariableLength ? undefined : evalIntConst(d.end);
+              return lo === undefined || hi === undefined ? null : [lo, hi];
+            }),
+            () => typeOf(def.elementType),
+          );
+        case "TypeReference":
+          // The library loader registers a struct it has no fields for as an alias of itself.
+          if (def.name.toUpperCase() === name) return opaque(key, name);
+          return aliasOf(key, name, () => typeOf(def));
+      }
+    }
+
+    const fb = symbolTables.lookupFunctionBlock(name);
+    if (fb) {
+      if (fb.libraryName !== undefined) {
+        const id = intern(key, (tid) => ({
+          id: tid,
+          kind: "fb",
+          name,
+          members: [
+            ...membersOf(
+              fb.inputs.map((v) => v.declaration),
+              "VAR_INPUT",
+            ),
+            ...membersOf(
+              fb.outputs.map((v) => v.declaration),
+              "VAR_OUTPUT",
+            ),
+            ...membersOf(
+              fb.inouts.map((v) => v.declaration),
+              "VAR_IN_OUT",
+            ),
+          ],
+          extends: null,
+        }));
+        if (!libraryFbTypes.some((l) => l.typeId === id)) {
+          libraryFbTypes.push({ name, typeId: id });
+        }
+        return id;
+      }
+      const decl = fb.declaration;
+      return intern(key, (id) => ({
+        id,
+        kind: "fb",
+        name,
+        members: instanceMembers(decl.varBlocks),
+        extends:
+          decl.extends !== undefined
+            ? namedType(decl.extends.toUpperCase())
+            : null,
+      }));
+    }
+
+    const prog = programByName.get(name);
+    if (prog) {
+      return intern(key, (id) => ({
+        id,
+        kind: "fb",
+        name,
+        members: instanceMembers(prog.varBlocks),
+        extends: null,
+      }));
+    }
+
+    if (interfaceNames.has(name)) {
+      return intern(key, (id) => ({
+        id,
+        kind: "ref",
+        name,
+        target: null,
+        refKind: "interface",
+      }));
+    }
+    return opaque(key, name);
+  };
+
+  const opaque = (key: string, name: string): number =>
+    intern(key, (id) => ({
+      id,
+      kind: "struct",
+      name,
+      members: [],
+      opaque: true,
+    }));
+
+  /** A TYPE alias takes its target's id; an alias cycle is described as opaque. */
+  const aliasOf = (key: string, name: string, target: () => number): number => {
+    if (
+      resolvingAliases.has(name) ||
+      resolvingAliases.size >= MAX_TYPE_ALIAS_DEPTH
+    ) {
+      return opaque(key, name);
+    }
+    resolvingAliases.add(name);
+    const id = target();
+    resolvingAliases.delete(name);
+    typeIdByKey.set(key, id);
+    return id;
+  };
+
+  // --- Globals ----------------------------------------------------------------
+
+  const firstLeaf = firstLeafByPrefix(input.leafPaths);
+  const globals: DebugInfoV1["globals"] = [];
+  const globalIndex = new Map<string, number>();
+  const globalBlocks = [
+    ...ast.configurations.flatMap((c) => c.varBlocks),
+    ...ast.globalVarBlocks,
+  ].filter((b) => b.blockType === "VAR_GLOBAL");
+  for (const block of globalBlocks) {
+    for (const decl of block.declarations) {
+      const typeId = typeOf(decl.type);
+      for (const name of decl.names) {
+        if (globalIndex.has(name)) continue;
+        globalIndex.set(name, globals.length);
+        globals.push({
+          name,
+          typeId,
+          location: decl.address ?? null,
+          leafBase: firstLeaf.get(name) ?? null,
+        });
+      }
+    }
+  }
+
+  // --- POUs -------------------------------------------------------------------
+
+  const pous: DebugPou[] = [];
+  const externals: DebugInfoV1["externals"] = [];
+
+  const localsOf = (
+    blocks: VarBlock[],
+    keep: (b: VarBlock) => boolean,
+  ): DebugLocal[] =>
+    blocks.filter(keep).flatMap((b) =>
+      b.declarations.flatMap((decl) => {
+        const typeId = typeOf(decl.type);
+        return decl.names.map((name) => ({
+          name,
+          typeId,
+          kind: b.blockType,
+          localsSlot: null,
+        }));
+      }),
+    );
+
+  const addPou = (
+    node: {
+      name: string;
+      varBlocks: VarBlock[];
+      sourceSpan: CompilationUnit["sourceSpan"];
+    },
+    kind: DebugPou["kind"],
+    owner: number | null,
+    typeId: number | null,
+    keepLocal: (b: VarBlock) => boolean,
+  ): number => {
+    const id = pous.length;
+    const span = node.sourceSpan;
+    pous.push({
+      id,
+      name: node.name,
+      kind,
+      owner,
+      file: fileIdByName.get(span.file) ?? null,
+      span: [span.startLine, span.startCol, span.endLine, span.endCol],
+      // TODO: the statement map sets entryProbe, cppSymbol and localsSlot (docs/DEBUG_INFO.md).
+      entryProbe: null,
+      noSource: false,
+      noSourceReason: null,
+      cppSymbol: null,
+      generated: false,
+      typeId,
+      locals: localsOf(node.varBlocks, keepLocal),
+    });
+    for (const block of node.varBlocks) {
+      if (block.blockType !== "VAR_EXTERNAL") continue;
+      for (const decl of block.declarations) {
+        for (const name of decl.names) {
+          externals.push({
+            pou: id,
+            name,
+            global: globalIndex.get(name) ?? null,
+          });
+        }
+      }
+    }
+    return id;
+  };
+
+  const isTemp = (b: VarBlock): boolean => b.blockType === "VAR_TEMP";
+  const isFrameVar = (b: VarBlock): boolean =>
+    b.blockType !== "VAR_EXTERNAL" && b.blockType !== "VAR_GLOBAL";
+
+  for (const prog of ast.programs) {
+    addPou(prog, "program", null, namedType(prog.name.toUpperCase()), isTemp);
+  }
+  for (const fb of ast.functionBlocks) {
+    const fbId = addPou(
+      fb,
+      "fb",
+      null,
+      namedType(fb.name.toUpperCase()),
+      isTemp,
+    );
+    for (const method of fb.methods) {
+      addPou(method, "method", fbId, null, isFrameVar);
+    }
+  }
+  for (const fn of ast.functions) {
+    addPou(fn, "function", null, null, isFrameVar);
+  }
+
+  // --- Instances --------------------------------------------------------------
+
+  const instances: DebugInfoV1["instances"] = {
+    path: [],
+    typeId: [],
+    leafBase: [],
+    leafBaseExt: [],
+  };
+  const holdsInstance = new Map<number, boolean>();
+  const holds = (typeId: number): boolean => {
+    const known = holdsInstance.get(typeId);
+    if (known !== undefined) return known;
+    holdsInstance.set(typeId, false);
+    const t = types[typeId]!;
+    const result =
+      t.kind === "fb" ||
+      (t.kind === "array" && holds(t.elem!)) ||
+      ((t.kind === "struct" || t.kind === "union") &&
+        (t.members ?? []).some((m) => holds(m.typeId)));
+    holdsInstance.set(typeId, result);
+    return result;
+  };
+
+  const walkMembers = (path: string, t: DebugType): void => {
+    if (t.extends !== undefined && t.extends !== null) {
+      walkMembers(path, types[t.extends]!);
+    }
+    for (const m of t.members ?? []) {
+      // An IN_OUT member refers to an instance owned elsewhere.
+      if (m.section === "VAR_IN_OUT" || !holds(m.typeId)) continue;
+      walkInstance(`${path}.${m.name}`, m.typeId);
+    }
+  };
+
+  const walkElements = (
+    path: string,
+    dims: Array<[number, number] | null>,
+    elem: number,
+  ): void => {
+    const [dim, ...rest] = dims;
+    if (dim === undefined) {
+      walkInstance(path, elem);
+      return;
+    }
+    if (dim === null) return;
+    for (let i = dim[0]; i <= dim[1]; i++) {
+      walkElements(`${path}[${i}]`, rest, elem);
+    }
+  };
+
+  const walkInstance = (path: string, typeId: number): void => {
+    const t = types[typeId]!;
+    if (t.kind === "fb") {
+      instances.path.push(path);
+      instances.typeId.push(typeId);
+      instances.leafBase.push(firstLeaf.get(path) ?? null);
+      // TODO: the second leaf pass over not-yet-covered sections sets leafBaseExt.
+      instances.leafBaseExt.push(null);
+    }
+    if (t.kind === "array") walkElements(path, t.dims ?? [], t.elem!);
+    else walkMembers(path, t);
+  };
+
+  for (const config of projectModel.configurations) {
+    for (const resource of config.resources) {
+      for (const task of resource.tasks) {
+        for (const pi of task.programInstances) {
+          const name = pi.programType.toUpperCase();
+          if (!programByName.has(name)) continue;
+          walkInstance(pi.instanceName.toUpperCase(), namedType(name));
+        }
+      }
+    }
+  }
+  for (const g of globals) {
+    if (holds(g.typeId)) walkInstance(g.name, g.typeId);
+  }
+
+  // Library blocks have no source here, but are still described.
+  for (const lib of libraryFbTypes) {
+    pous.push({
+      id: pous.length,
+      name: lib.name,
+      kind: "fb",
+      owner: null,
+      file: null,
+      span: null,
+      entryProbe: null,
+      noSource: true,
+      noSourceReason: "library",
+      cppSymbol: null,
+      generated: false,
+      typeId: lib.typeId,
+      locals: [],
+    });
+  }
+
+  // --- Build identity --------------------------------------------------------
+
+  const options = { ...input.options, debugProbes: false };
+  const compiler = `strucpp ${input.compilerVersion}`;
+  const buildId = sha256Hex(
+    [
+      compiler,
+      canonicalJson(options),
+      ...files.map((f) => `${f.path}\n${f.sha256}`),
+      ...input.libraries.map(
+        (l) => `${l.manifest.name}\n${l.manifest.version}\n${archiveHash(l)}`,
+      ),
+    ].join("\n"),
+  );
+
+  return {
+    format: DEBUG_INFO_FORMAT,
+    major: DEBUG_INFO_MAJOR,
+    minor: DEBUG_INFO_MINOR,
+    build: { md5: input.md5, buildId, compiler, options, probes: false },
+    files,
+    pous,
+    // TODO: the statement map fills probes and lines (docs/DEBUG_INFO.md).
+    probes: {
+      pou: [],
+      file: [],
+      line: [],
+      col: [],
+      endLine: [],
+      endCol: [],
+      kind: [],
+      flags: [],
+      origin: [],
+    },
+    lines: {},
+    types,
+    instances,
+    globals,
+    externals,
+    origins: [],
+    formats: [],
+  };
 }

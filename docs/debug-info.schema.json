@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/Autonomy-Logic/STruCpp/docs/debug-info.schema.json",
   "title": "STruC++ debug-info.json, major 1",
-  "description": "Statement, scope and type information for one build (ADR-002 D3). Every object permits additional properties: a minor version only adds fields, and readers ignore what they do not know (ADR-002 D2). Prose: docs/DEBUG_INFO.md.",
+  "description": "Statement, scope and type information for one build. Every object permits additional properties: a minor version only adds fields, and readers ignore what they do not know. Prose: docs/DEBUG_INFO.md.",
   "type": "object",
   "required": ["format", "major", "minor", "build", "files", "pous", "probes", "lines", "types", "instances", "globals", "externals", "origins", "formats"],
   "properties": {
