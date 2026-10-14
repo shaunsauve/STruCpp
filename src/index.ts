@@ -21,6 +21,7 @@ import { buildProjectModel } from "./project-model.js";
 import { SymbolTables } from "./semantic/symbol-table.js";
 import { SemanticAnalyzer } from "./semantic/analyzer.js";
 import { CodeGenerator } from "./backend/codegen.js";
+import { planProbes } from "./backend/probe-plan.js";
 import {
   generateDebugTable,
   type DebugMapV2,
@@ -794,6 +795,18 @@ export function compile(
     codegen.addLibraryChunks(archive, reachable);
   }
 
+  const sourceFiles = [
+    {
+      fileName: pipeline.mergedOptions.fileName ?? "main.st",
+      source,
+    },
+    ...(pipeline.mergedOptions.additionalSources ?? []),
+  ];
+  const probePlan = planProbes(
+    pipeline.ast,
+    sourceFiles.map((f) => f.fileName),
+  );
+  codegen.setProbePlan(probePlan);
   const codeResult = codegen.generate(pipeline.ast);
 
   // Collect codegen warnings
@@ -831,10 +844,8 @@ export function compile(
       projectModel: pipeline.projectModel,
       symbolTables: pipeline.symbolTables,
       leafPaths: dbg.debugMap.leaves.map((l) => l.path),
-      sources: [
-        { fileName: opts.fileName ?? "main.st", source },
-        ...(opts.additionalSources ?? []),
-      ],
+      sources: sourceFiles,
+      probePlan,
       libraries: pipeline.allArchives,
       md5: opts.md5 ?? "",
       compilerVersion: getVersion(),

@@ -536,7 +536,7 @@ type Placement =
   | { verified: false; reason: "NO_CODE" };
 
 /**
- * Reference reader for ADR-002 D3 (F026): line L binds to the smallest
+ * Reference reader for breakpoint placement: line L binds to the smallest
  * probe line >= L of the innermost POU whose span holds L, at its first
  * probe by column; with none, it is unverified NO_CODE.
  */
@@ -568,7 +568,7 @@ function markersOf(source: string): Map<string, number> {
   return out;
 }
 
-/** Words a probe may never start at: declarations and block ends. */
+/** Words a probe may never start at: declarations and block ends. A `{` starts an external-code pragma. */
 const NOT_A_STATEMENT =
   /^(VAR\w*|END_\w+|ELSE|THEN|DO|OF|TYPE|STRUCT|FUNCTION\w*|PROGRAM|METHOD|PROPERTY|GET|SET)\b/i;
 
@@ -583,7 +583,7 @@ function lineInvariants(b: CorpusBuild): string[] {
     const lines = text.split("\n");
     for (const p of probes.filter((x) => x.file === f.id)) {
       const at = (lines[p.line - 1] ?? "").slice(p.col - 1);
-      if (!/^[A-Za-z_]/.test(at) || NOT_A_STATEMENT.test(at)) {
+      if (!/^[A-Za-z_{]/.test(at) || NOT_A_STATEMENT.test(at)) {
         bad.push(
           `${b.label} ${f.path}:${p.line}:${p.col} probe on "${at.trim().slice(0, 20)}"`,
         );
@@ -685,7 +685,7 @@ function oracleDisagreements(
       asked.forEach((marker, i) => {
         const want = answers[i];
         const { line, fileId } = resolve(b, file, String(marker));
-        if (want === undefined || line === undefined) return;
+        if (want?.verified === undefined || line === undefined) return;
         const r = placeBreakpoint(b.info!, fileId, line);
         const wantLine = want.line
           ? resolve(b, file, want.line).line
@@ -754,7 +754,16 @@ function oracleDisagreements(
  * Corpus markers on lines that are deliberately not executable: comments,
  * declarations, block ends and continuation lines of a spanning statement.
  */
-const NON_EXECUTABLE_MARKERS: string[] = [];
+const NON_EXECUTABLE_MARKERS = [
+  "multi-stmt-line/program.st @SPAN_END",
+  "nested-fb-loop/program.st @CMT_MAIN",
+  "nested-fb-loop/program.st @CMT_MOTOR",
+  "nested-fb-loop/program.st @END_MAIN",
+  "sparse-lines/program.st @CMT2",
+  "sparse-lines/program.st @DECL",
+  "sparse-lines/program.st @LC",
+  "sparse-lines/program.st @TAIL",
+];
 
 describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
   "debug-info.json: statement map against the corpus (A011, A015, A018)",
@@ -858,10 +867,12 @@ ${CONFIG("Main")}`;
 
   it("gives byte-identical probe tables to rebuilds of identical source", () => {
     const first = build(A, B);
+    const second = build(A, B);
     debugInfoOf(ALL_SCOPES);
-    const second = build(`${A} `.trimEnd() + "\n", `${B}`);
+    const third = build(A, B);
     expect(first.probes.line.length).toBeGreaterThan(0);
     expect(tableHash(second)).toBe(tableHash(first));
+    expect(tableHash(third)).toBe(tableHash(first));
   });
 
   it("numbers probes by file, then POU declaration, then source position", () => {

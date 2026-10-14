@@ -843,20 +843,24 @@ export class ASTBuilder {
 
     // GET block
     let getter: Statement[] | undefined;
+    let getterSpan: SourceSpan | undefined;
     const getterNode = getFirstNode(children.propertyGetter);
     if (getterNode) {
       const getterChildren = getterNode.children as CstChildren;
       const getterStmtList = getFirstNode(getterChildren.statementList);
       getter = this.extractStatementsFromList(getterStmtList);
+      getterSpan = nodeToSourceSpan(getterNode);
     }
 
     // SET block
     let setter: Statement[] | undefined;
+    let setterSpan: SourceSpan | undefined;
     const setterNode = getFirstNode(children.propertySetter);
     if (setterNode) {
       const setterChildren = setterNode.children as CstChildren;
       const setterStmtList = getFirstNode(setterChildren.statementList);
       setter = this.extractStatementsFromList(setterStmtList);
+      setterSpan = nodeToSourceSpan(setterNode);
     }
 
     return {
@@ -867,6 +871,8 @@ export class ASTBuilder {
       visibility,
       ...(getter !== undefined ? { getter } : {}),
       ...(setter !== undefined ? { setter } : {}),
+      ...(getterSpan !== undefined ? { getterSpan } : {}),
+      ...(setterSpan !== undefined ? { setterSpan } : {}),
     };
   }
 
@@ -2080,11 +2086,13 @@ export class ASTBuilder {
     const stmtListNode = getFirstNode(children.statementList);
     const body = this.extractStatementsFromList(stmtListNode);
 
+    const untilToken = getAllTokens(children.UNTIL)[0];
     return {
       kind: "RepeatStatement",
       sourceSpan: nodeToSourceSpan(node),
       body,
       condition: condition!,
+      ...(untilToken ? { untilSpan: tokenToSourceSpan(untilToken) } : {}),
     };
   }
 

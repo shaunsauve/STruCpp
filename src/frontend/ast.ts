@@ -201,6 +201,10 @@ export interface PropertyDeclaration extends ASTNode {
   visibility: Visibility;
   getter?: Statement[];
   setter?: Statement[];
+  /** Span of the GET ... END_GET block. */
+  getterSpan?: SourceSpan;
+  /** Span of the SET ... END_SET block. */
+  setterSpan?: SourceSpan;
 }
 
 // =============================================================================
@@ -591,6 +595,8 @@ export interface RepeatStatement extends ASTNode {
   kind: "RepeatStatement";
   body: Statement[];
   condition: Expression;
+  /** Span of the UNTIL keyword. */
+  untilSpan?: SourceSpan;
 }
 
 /**

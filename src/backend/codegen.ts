@@ -19,6 +19,7 @@ import type {
   ForStatement,
   WhileStatement,
   RepeatStatement,
+  ElsifClause,
   FunctionCallExpression,
   Argument,
   MethodCallExpression,
@@ -37,6 +38,7 @@ import type {
 } from "../frontend/ast.js";
 import type { SymbolTables } from "../semantic/symbol-table.js";
 import type { LineMapEntry } from "../types.js";
+import type { ProbeKind, ProbePlan } from "./probe-plan.js";
 import { StdFunctionRegistry } from "../semantic/std-function-registry.js";
 import type {
   ProjectModel,
@@ -424,6 +426,7 @@ export class CodeGenerator {
   private stdRegistry: StdFunctionRegistry;
 
   /** Warnings collected during code generation */
+  private probePlan: ProbePlan | undefined;
   private codegenWarnings: Array<{
     message: string;
     line?: number;
@@ -780,6 +783,11 @@ export class CodeGenerator {
    */
   setProjectModel(model: ProjectModel): void {
     this.projectModel = model;
+  }
+
+  /** Probe IDs to record in `lineMap` for each statement (see probe-plan.ts). */
+  setProbePlan(plan: ProbePlan): void {
+    this.probePlan = plan;
   }
 
   /**
@@ -3125,6 +3133,7 @@ export class CodeGenerator {
     if (!isCompound) {
       this.recordLineMapping(stmt.sourceSpan.startLine, cppStartLine);
     }
+    if (stmt.kind !== "AssertCall") this.noteProbe(stmt, 0, cppStartLine);
   }
 
   /**
@@ -3399,6 +3408,7 @@ export class CodeGenerator {
         `${indent}} else if (${this.generateExpression(elsif.condition)}) {`,
       );
       this.recordLineMapping(elsif.sourceSpan.startLine, elsifLine);
+      this.noteProbe(elsif, 2, elsifLine);
       this.generateStatements(elsif.statements, indent + this.options.indent);
     }
 
@@ -3525,6 +3535,7 @@ export class CodeGenerator {
       );
     }
     this.recordLineMapping(stmt.sourceSpan.startLine, forLine);
+    this.noteProbe(stmt, 1, forLine);
 
     const exitLabel = {
       name: `__strucpp_loop_exit_${this.loopExitLabelCounter++}`,
@@ -3548,6 +3559,7 @@ export class CodeGenerator {
     const whileLine = this.currentLine;
     this.emit(`${indent}while (${this.generateExpression(stmt.condition)}) {`);
     this.recordLineMapping(stmt.sourceSpan.startLine, whileLine);
+    this.noteProbe(stmt, 1, whileLine);
     const exitLabel = {
       name: `__strucpp_loop_exit_${this.loopExitLabelCounter++}`,
       used: false,
@@ -3584,6 +3596,7 @@ export class CodeGenerator {
     );
     if (exitLabel.used) this.emit(`${indent}${exitLabel.name}: ;`);
     this.recordLineMapping(stmt.sourceSpan.endLine, untilLine);
+    this.noteProbe(stmt, 1, untilLine);
   }
 
   /**
@@ -6367,6 +6380,36 @@ export class CodeGenerator {
         cppEndLine: lastEmittedLine,
       });
     }
+  }
+
+  /**
+   * Record the planned probe of `node` on its ST line. A statement the plan
+   * does not know is reported, since it would run with no probe.
+   */
+  private noteProbe(
+    node: Statement | ElsifClause,
+    kind: ProbeKind,
+    cppLine: number,
+  ): void {
+    if (!this.probePlan) return;
+    const id = this.probePlan.idOf(node, kind);
+    if (id === undefined) {
+      this.codegenWarnings.push({
+        message: `Internal: no debug probe planned for this statement (kind ${kind})`,
+        line: node.sourceSpan.startLine,
+        column: node.sourceSpan.startCol,
+        file: node.sourceSpan.file,
+      });
+      return;
+    }
+    const stLine = this.probePlan.probes[id]!.line;
+    let entry = this.lineMap.get(stLine);
+    if (entry === undefined) {
+      entry = { cppStartLine: cppLine, cppEndLine: this.currentLine - 1 };
+      this.lineMap.set(stLine, entry);
+    }
+    const ids = (entry.probeIds ??= []);
+    if (!ids.includes(id)) ids.push(id);
   }
 
   private recordHeaderLineMapping(

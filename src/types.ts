@@ -176,6 +176,9 @@ export interface LineMapEntry {
 
   /** Last C++ line for this ST line */
   cppEndLine: number;
+
+  /** Probe IDs starting on this ST line, in emission order (`debug-info.json` `probes`). */
+  probeIds?: number[];
 }
 
 /**

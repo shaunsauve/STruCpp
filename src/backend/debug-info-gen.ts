@@ -8,6 +8,7 @@
  *   docs/debug-info.schema.json - the published schema for this file.
  *   docs/DEBUG_INFO.md - prose description of every field.
  *   src/backend/sha256.ts - file hashes and the build identity.
+ *   src/backend/probe-plan.ts - probe numbering, serialised here as `probes` and `lines`.
  */
 
 import type {
@@ -23,6 +24,7 @@ import type { StlibArchive } from "../library/library-manifest.js";
 import { isElementaryType } from "../semantic/type-registry.js";
 import { evalIntConst, MAX_TYPE_ALIAS_DEPTH } from "../semantic/type-utils.js";
 import { sha256Hex } from "./sha256.js";
+import type { ProbePlan } from "./probe-plan.js";
 
 export const DEBUG_INFO_FORMAT = "strucpp-debug-info";
 export const DEBUG_INFO_MAJOR = 1;
@@ -187,6 +189,8 @@ export interface DebugInfoInput {
   /** Compile options that change generated code. */
   options: Record<string, unknown>;
   globalConstants?: Record<string, number>;
+  /** Probe numbering shared with codegen's `lineMap`. */
+  probePlan: ProbePlan;
 }
 
 /** Var blocks stored in a program or FB instance; VAR_TEMP is frame storage, VAR_EXTERNAL a global. */
@@ -563,6 +567,7 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
   // --- POUs -------------------------------------------------------------------
 
   const pous: DebugPou[] = [];
+  const pouIdByBody = new Map<object, number>();
   const externals: DebugInfoV1["externals"] = [];
 
   const localsOf = (
@@ -591,8 +596,10 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     owner: number | null,
     typeId: number | null,
     keepLocal: (b: VarBlock) => boolean,
+    body: object = node,
   ): number => {
     const id = pous.length;
+    pouIdByBody.set(body, id);
     const span = node.sourceSpan;
     pous.push({
       id,
@@ -601,7 +608,7 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
       owner,
       file: fileIdByName.get(span.file) ?? null,
       span: [span.startLine, span.startCol, span.endLine, span.endCol],
-      // TODO: the statement map sets entryProbe, cppSymbol and localsSlot (docs/DEBUG_INFO.md).
+      // TODO: probe builds set cppSymbol and localsSlot (docs/DEBUG_INFO.md).
       entryProbe: null,
       noSource: false,
       noSourceReason: null,
@@ -643,9 +650,75 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     for (const method of fb.methods) {
       addPou(method, "method", fbId, null, isFrameVar);
     }
+    // Accessors are bodies of their own (get_P / set_P in C++); named P.GET / P.SET.
+    for (const prop of fb.properties) {
+      const accessors: Array<
+        [string, typeof prop.getter, typeof prop.getterSpan]
+      > = [
+        ["GET", prop.getter, prop.getterSpan],
+        ["SET", prop.setter, prop.setterSpan],
+      ];
+      for (const [suffix, statements, span] of accessors) {
+        if (!statements) continue;
+        addPou(
+          {
+            name: `${prop.name}.${suffix}`,
+            varBlocks: [],
+            sourceSpan: span
+              ? { ...span, file: prop.sourceSpan.file }
+              : prop.sourceSpan,
+          },
+          "method",
+          fbId,
+          null,
+          isFrameVar,
+          statements,
+        );
+      }
+    }
   }
   for (const fn of ast.functions) {
     addPou(fn, "function", null, null, isFrameVar);
+  }
+
+  // --- Statement map ---------------------------------------------------------
+
+  const probes: DebugProbes = {
+    pou: [],
+    file: [],
+    line: [],
+    col: [],
+    endLine: [],
+    endCol: [],
+    kind: [],
+    flags: [],
+    origin: [],
+  };
+  const lineSets = new Map<number, Set<number>>(
+    files.map((f) => [f.id, new Set<number>()]),
+  );
+  input.probePlan.probes.forEach((p, id) => {
+    const pou = pouIdByBody.get(p.body);
+    const file = fileIdByName.get(p.file);
+    if (pou === undefined || file === undefined) {
+      throw new Error(`probe ${id} at ${p.file}:${p.line} has no POU or file`);
+    }
+    probes.pou.push(pou);
+    probes.file.push(file);
+    probes.line.push(p.line);
+    probes.col.push(p.col);
+    probes.endLine.push(p.endLine);
+    probes.endCol.push(p.endCol);
+    probes.kind.push(p.kind);
+    // TODO: set the generated and locked flags (docs/DEBUG_INFO.md).
+    probes.flags.push(0);
+    probes.origin.push(-1);
+    lineSets.get(file)!.add(p.line);
+    pous[pou]!.entryProbe ??= id;
+  });
+  const lines: Record<string, number[]> = {};
+  for (const [file, set] of lineSets) {
+    lines[String(file)] = [...set].sort((a, b) => a - b);
   }
 
   // --- Instances --------------------------------------------------------------
@@ -767,19 +840,8 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     build: { md5: input.md5, buildId, compiler, options, probes: false },
     files,
     pous,
-    // TODO: the statement map fills probes and lines (docs/DEBUG_INFO.md).
-    probes: {
-      pou: [],
-      file: [],
-      line: [],
-      col: [],
-      endLine: [],
-      endCol: [],
-      kind: [],
-      flags: [],
-      origin: [],
-    },
-    lines: {},
+    probes,
+    lines,
     types,
     instances,
     globals,

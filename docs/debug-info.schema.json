@@ -92,7 +92,7 @@
     "lines": {
       "type": "object",
       "propertyNames": { "pattern": "^(0|[1-9][0-9]*)$" },
-      "additionalProperties": { "$ref": "#/definitions/countColumn" }
+      "additionalProperties": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "uniqueItems": true }
     },
     "types": {
       "type": "array",

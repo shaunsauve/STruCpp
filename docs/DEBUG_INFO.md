@@ -1,8 +1,7 @@
 # debug-info.json (major 1)
 
 `debug-info.json` describes one build for a source-level debugger: its files, its POUs, every
-variable of every scope with its IEC type, the instance tree, and (once probes exist) the
-statement map. It is a host-side file: nothing in it is linked into the runtime image.
+variable of every scope with its IEC type, the instance tree, and the statement map. It is a host-side file: nothing in it is linked into the runtime image.
 
 - Schema: [`debug-info.schema.json`](debug-info.schema.json) (JSON Schema draft-07).
 - Produced by `compile()` as `CompileResult.debugInfo`; serialise it with `serializeDebugInfo()`
@@ -50,7 +49,9 @@ One entry per user source file, in compile order. `id` is the index other tables
 ## `pous`
 
 One entry per program, function block, function and method of the user source, then one per
-library function block that the program instantiates (with no source).
+library function block that the program instantiates (with no source). Each property accessor is
+a body of its own and is listed as a `method` of its function block named `<property>.GET` or
+`<property>.SET` (`P.GET`); its `span` is the `GET ... END_GET` or `SET ... END_SET` block.
 
 | Field | Meaning |
 |---|---|
@@ -60,7 +61,7 @@ library function block that the program instantiates (with no source).
 | `owner` | For a method, the `id` of its function block; otherwise `null`. |
 | `file` | `files[].id` of the declaring file, or `null` for a library POU. |
 | `span` | `[startLine, startCol, endLine, endCol]` of the declaration, 1-based, or `null`. |
-| `entryProbe` | First probe of the body. `null` until the statement map exists. |
+| `entryProbe` | First probe of the body (the lowest probe ID of this POU), or `null` when the body is empty or has no source. |
 | `noSource` | `true` when the POU has no source in this build. |
 | `noSourceReason` | `library`, `binary` or `optout` when `noSource` is `true`, else `null`. |
 | `cppSymbol` | Mangled C++ symbol of the body, or `null` when not recorded. |
@@ -91,25 +92,67 @@ method, and the `VAR_TEMP` variables of a program or function block.
 
 ## `probes`
 
-The statement map, columnar: index `i` of every array describes probe ID `i`. Empty until the
-compiler plants probes.
+The statement map, columnar: index `i` of every array describes probe ID `i`. Every executable
+statement of every POU with source has one probe; compound statements (`IF`, `CASE`, `FOR`,
+`WHILE`, `REPEAT`) included. Declarations, comments, blank lines and block ends (`END_IF`,
+`ELSE`, `END_PROGRAM`) have none. The table is present in every build; `build.probes` says
+whether the probes are planted in the generated code.
 
 | Field | Meaning |
 |---|---|
 | `pou` | `pous[].id` of the probe's POU. |
 | `file` | `files[].id` of the probe's file. |
-| `line` | First line of the statement, 1-based. |
-| `col` | First column, 1-based. |
-| `endLine` | Last line. |
-| `endCol` | Last column. |
+| `line` | First line of the range, 1-based. |
+| `col` | First column of the range, 1-based. |
+| `endLine` | Last line of the range. |
+| `endCol` | Last column of the range, inclusive. |
 | `kind` | `0` statement, `1` loop condition, `2` ELSIF condition; `3` reserved. |
-| `flags` | bit 0 generated, bit 1 library, bit 2 locked. |
+| `flags` | bit 0 generated, bit 1 library, bit 2 locked. Always `0` today. |
 | `origin` | Index into `origins`, or `-1`. |
+
+**Ranges.** A simple statement's range is the whole statement, through its `;`, however many
+lines it spans; statements sharing a line each have their own range. A compound statement's
+range is its header, from the keyword to the end of its condition or selector
+(`IF r < lo`, `FOR i := 1 TO 3`). The extra probes are:
+
+| Statement | Probes, in ID order |
+|---|---|
+| `IF` | `0` on the header, then each `ELSIF`'s `2` on `ELSIF` and its condition |
+| `FOR` | `0` on the header (initialisation), `1` on the same header (each test of the bound) |
+| `WHILE` | `0` on the header, `1` on the same header (each test of the condition) |
+| `REPEAT` | `0` on the `REPEAT` keyword, then the body, then `1` on `UNTIL` and its condition |
+
+**Numbering.** Probe IDs are dense, from 0, assigned in one deterministic walk: source files in
+compile order, then POUs by the position of their declaration, then statements in source order.
+A POU's probes are therefore one contiguous ID range starting at its `entryProbe`; a method's or
+accessor's range follows its function block's own body.
+
+**Stability.** Rebuilding byte-identical sources with identical options gives byte-identical
+`probes` and `lines`. Probe IDs are not stable across edits: an added or removed statement
+renumbers every later probe. A client holding breakpoints across a rebuild re-resolves them by
+`(file sha256, line, column)`, never by ID; an unedited file keeps its `sha256` and the
+locations of its statements.
+
+`compile()` also records each probe ID in `CompileResult.lineMap`, under the ST line where the
+probe starts (`probeIds`), from the same numbering.
 
 ## `lines`
 
-Keyed by `files[].id` (as a string): the sorted lines that carry at least one probe. Empty until
-the compiler plants probes.
+Keyed by `files[].id` (as a string), one key per file: the sorted, distinct lines on which at
+least one probe starts. These are the breakpoint-able lines; a client needs nothing else to
+show them.
+
+**Breakpoint placement** (F026). A breakpoint requested on line `L` of a file binds as follows:
+
+1. Find the innermost POU whose `span` holds `L` (a method or accessor inside its function
+   block). If there is none, the breakpoint is unverified with reason `NO_CODE`.
+2. Among that POU's probes, take those starting on a line `>= L`. The breakpoint binds to the
+   smallest such line, at its first probe by column, and is verified at that line.
+3. If there is none, it is unverified with `NO_CODE`. A breakpoint never moves into another
+   POU.
+
+A listed line therefore binds where it was asked; an unlisted line binds to a later line, or not
+at all.
 
 ## `types`
 
