@@ -92,7 +92,7 @@ src/
 
 ### Lexer
 
-Chevrotain tokenizer with case-insensitive keywords. All keywords use `LONGER_ALT = Identifier` to prevent keyword/identifier conflicts. Custom pattern matchers handle time literals (`T#1h2m3s`), typed literals (`DINT#42`), nested comment blocks (`(* ... (* ... *) ... *)`), and pragma blocks (`{external ...}`).
+Chevrotain tokenizer with case-insensitive keywords. All keywords use `LONGER_ALT = Identifier` to prevent keyword/identifier conflicts. Custom pattern matchers handle time literals (`T#1h2m3s`), typed literals (`DINT#42`), nested comment blocks (`(* ... (* ... *) ... *)`), pragma blocks (`{external ...}`), and the generated-code pragmas (`{strucpp generated}`, `{strucpp generated_begin}` … `{strucpp generated_end}`), lexed into a `pragmas` token group the parser never sees; `src/frontend/generated-pragmas.ts` turns them into generated ranges for the debug info.
 
 ### Parser
 

@@ -2212,13 +2212,17 @@ export const testParser = new STParser(tokens.allTestTokens);
 export function parse(source: string): {
   cst: CstNode | null;
   errors: unknown[];
+  /** `{strucpp generated...}` pragma tokens, in source order. */
+  pragmas: IToken[];
 } {
   const lexResult = tokens.tokenize(source);
+  const pragmas = lexResult.groups["pragmas"] ?? [];
 
   if (lexResult.errors.length > 0) {
     return {
       cst: null,
       errors: lexResult.errors,
+      pragmas,
     };
   }
 
@@ -2228,6 +2232,7 @@ export function parse(source: string): {
   return {
     cst,
     errors: parser.errors,
+    pragmas,
   };
 }
 

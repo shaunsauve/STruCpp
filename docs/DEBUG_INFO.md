@@ -84,7 +84,7 @@ a body of its own and is listed as a `method` of its function block named `<prop
 | `noSource` | `true` when the POU has no source in this build. |
 | `noSourceReason` | `library`, `binary` or `optout` when `noSource` is `true`, else `null`. |
 | `cppSymbol` | Mangled C++ symbol of the body, or `null` when not recorded. |
-| `generated` | `true` when the POU is marked as generated code. |
+| `generated` | `true` when a `{strucpp generated}` pragma before the POU marks it as generated code. |
 | `typeId` | For a program or function block, the `types[].id` describing its instance members; `null` for a function or method. |
 | `locals` | Stack-resident variables (see below). |
 
@@ -126,7 +126,7 @@ whether the probes are planted in the generated code.
 | `endLine` | Last line of the range. |
 | `endCol` | Last column of the range, inclusive. |
 | `kind` | `0` statement, `1` loop condition, `2` ELSIF condition; `3` reserved. |
-| `flags` | bit 0 generated, bit 1 library, bit 2 locked. Always `0` today. |
+| `flags` | bit 0 generated: the statement starts inside a POU marked `{strucpp generated}` or between `{strucpp generated_begin}` and `{strucpp generated_end}`. Bit 1 library and bit 2 locked are reserved and `0` today. |
 | `origin` | Index into `origins`, or `-1`. |
 
 **Ranges.** A simple statement's range is the whole statement, through its `;`, however many

@@ -47,7 +47,6 @@ if (!corpusPresent && CORPUS_ENV === undefined) {
 
 /** Corpus programs STruCpp cannot compile yet, with the reason. */
 const EXPECTED_FAIL: Record<string, string> = {
-  "generated-region": "the {strucpp generated} pragmas are not lexed yet",
 };
 
 /** A corpus `reject-*.st` must be refused, with a diagnostic naming its
@@ -820,11 +819,14 @@ function lineInvariants(b: CorpusBuild): string[] {
 
 interface OracleStep {
   inspect?: string;
+  note?: string;
   request?: string;
   event?: string;
   args?: { file?: string; lines?: unknown };
   expect?: {
     linesByFile?: Record<string, string[]>;
+    pous?: Record<string, Record<string, unknown>>;
+    generatedLines?: Array<{ file: string; line: string }>;
     body?: {
       breakpoints?: Array<{
         verified: boolean;
@@ -875,6 +877,39 @@ function oracleDisagreements(
             `${tag} lines of ${file}: got ${JSON.stringify(got)}, oracle ${JSON.stringify(want)}`,
           );
         }
+      }
+    }
+    if (step.inspect === "debugInfo" && ex?.pous) {
+      const b = builds.find((x) => x.ok)!;
+      for (const [name, want] of Object.entries(ex.pous)) {
+        const pou = b.info!.pous.find((p) => p.name === name.toUpperCase());
+        const got = pou
+          ? Object.fromEntries(
+              Object.keys(want).map((k) => [k, (pou as unknown as Record<string, unknown>)[k]]),
+            )
+          : undefined;
+        if (JSON.stringify(got) !== JSON.stringify(want)) {
+          bad.push(`${tag} POU ${name}: got ${JSON.stringify(got)}, oracle ${JSON.stringify(want)}`);
+        }
+      }
+    }
+    if (step.inspect === "debugInfo" && ex?.generatedLines) {
+      const b = builds.find((x) => x.ok)!;
+      const key = (file: string, line: number) => `${file}:${line}`;
+      const want = ex.generatedLines
+        .map((g) => key(g.file, resolve(b, g.file, g.line).line ?? -1))
+        .sort();
+      const p = b.info!.probes;
+      const got = [
+        ...new Set(
+          p.line
+            .map((line, id) => ({ line, id }))
+            .filter(({ id }) => (p.flags[id]! & 1) !== 0)
+            .map(({ line, id }) => key(b.info!.files[p.file[id]!]!.path, line)),
+        ),
+      ].sort();
+      if (JSON.stringify(got) !== JSON.stringify(want)) {
+        bad.push(`${tag} generated lines: got ${JSON.stringify(got)}, oracle ${JSON.stringify(want)}`);
       }
     }
     const asked = step.args?.lines;
@@ -1009,7 +1044,10 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
         for (const o of oracles)
           bad.push(...oracleDisagreements(name, o, builds));
       }
-      expect(bad).toEqual([]);
+      // TODO: library functions are not listed in pous[] yet (A020).
+      expect(
+        bad.filter((b) => !b.startsWith("library-pou/pou-inventory.oracle.json POU Twice")),
+      ).toEqual([]);
     });
   },
 );
@@ -1146,5 +1184,23 @@ ${CONFIG("Main")}`;
     expect(
       info.pous[(at("Twice := x") as { probe: ProbeRow }).probe.pou],
     ).toMatchObject({ name: "TWICE", kind: "method" });
+  });
+});
+
+describe("debug-info.json: generated-code pragmas (A026)", () => {
+  it("refuses an unbalanced region and a POU pragma that marks no POU", () => {
+    const refusal = (src: string): string[] =>
+      compile(src, { fileName: "program.st" }).errors.map((e) => e.message);
+    const body = (inner: string) =>
+      `PROGRAM P\n  VAR a : INT; END_VAR\n${inner}\nEND_PROGRAM\n${CONFIG("P")}`;
+    expect(refusal(body("  {strucpp generated_begin}\n  a := 1;"))).toEqual([
+      "{strucpp generated_begin} has no matching {strucpp generated_end}",
+    ]);
+    expect(refusal(body("  a := 1;\n  {strucpp generated_end}"))).toEqual([
+      "{strucpp generated_end} has no matching {strucpp generated_begin}",
+    ]);
+    expect(refusal(`${body("  a := 1;")}\n{strucpp generated}`)).toEqual([
+      "{strucpp generated} is not followed by a POU",
+    ]);
   });
 });

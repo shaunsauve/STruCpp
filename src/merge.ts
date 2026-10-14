@@ -37,6 +37,9 @@ export function mergeCompilationUnits(
     merged.types.push(...unit.types);
     merged.configurations.push(...unit.configurations);
     merged.globalVarBlocks.push(...unit.globalVarBlocks);
+    if (unit.generatedRegions) {
+      (merged.generatedRegions ??= []).push(...unit.generatedRegions);
+    }
   }
 
   // Use the source span from the first unit

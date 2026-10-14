@@ -24,9 +24,12 @@ import type { StlibArchive } from "../library/library-manifest.js";
 import { isElementaryType } from "../semantic/type-registry.js";
 import { evalIntConst, MAX_TYPE_ALIAS_DEPTH } from "../semantic/type-utils.js";
 import { sha256Hex } from "./sha256.js";
+import { spanContains } from "../frontend/generated-pragmas.js";
 import type { ProbePlan } from "./probe-plan.js";
 
 export const DEBUG_INFO_FORMAT = "strucpp-debug-info";
+/** `probes.flags` bit 0: the statement is in generated code. */
+export const PROBE_FLAG_GENERATED = 1;
 export const DEBUG_INFO_MAJOR = 1;
 export const DEBUG_INFO_MINOR = 0;
 
@@ -750,7 +753,13 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
       noSource: false,
       noSourceReason: null,
       cppSymbol: null,
-      generated: false,
+      generated: (ast.generatedRegions ?? []).some(
+        (r) =>
+          r.pou &&
+          r.span.file === span.file &&
+          spanContains(r.span, span.startLine, span.startCol) &&
+          spanContains(r.span, span.endLine, span.endCol),
+      ),
       typeId,
       locals: localsOf(node.varBlocks, keepLocal),
     });
@@ -847,8 +856,11 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     probes.endLine.push(p.endLine);
     probes.endCol.push(p.endCol);
     probes.kind.push(p.kind);
-    // TODO: set the generated and locked flags (docs/DEBUG_INFO.md).
-    probes.flags.push(0);
+    // TODO: set the locked flag (docs/DEBUG_INFO.md).
+    const generated = (ast.generatedRegions ?? []).some(
+      (r) => r.span.file === p.file && spanContains(r.span, p.line, p.col),
+    );
+    probes.flags.push(generated ? PROBE_FLAG_GENERATED : 0);
     probes.origin.push(-1);
     lineSets.get(file)!.add(p.line);
     pous[pou]!.entryProbe ??= id;

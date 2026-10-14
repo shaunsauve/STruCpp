@@ -14,6 +14,8 @@ import {
   AnalysisResult,
 } from "./types.js";
 import { parse as parseSource } from "./frontend/parser.js";
+import { resolveGeneratedPragmas } from "./frontend/generated-pragmas.js";
+import type { IToken } from "chevrotain";
 import { suggestionForParseError } from "./frontend/parser-error-message-provider.js";
 import { buildAST } from "./frontend/ast-builder.js";
 import { transpileILSource } from "./il/il-transpiler.js";
@@ -391,6 +393,23 @@ function runPipeline(
       globalConstants,
     );
     const units: CompilationUnit[] = [primaryAst];
+    const applyPragmas = (
+      unit: CompilationUnit,
+      pragmas: IToken[],
+      file: string,
+    ): void => {
+      if (pragmas.length === 0) return;
+      const r = resolveGeneratedPragmas(unit, pragmas, file);
+      if (r.regions.length > 0) unit.generatedRegions = r.regions;
+      for (const e of r.errors) {
+        errors.push({ ...e, severity: "error", file });
+      }
+    };
+    applyPragmas(
+      primaryAst,
+      parseResult.pragmas,
+      mergedOptions.fileName ?? "main.st",
+    );
 
     // Parse additional source files. Each gets the same Phase 0
     // IL→ST transpilation as the primary source — without it, an IL
@@ -446,13 +465,13 @@ function runPipeline(
         }
         if (addlParseResult.cst) {
           try {
-            units.push(
-              buildAST(
-                addlParseResult.cst,
-                addlSource.fileName,
-                globalConstants,
-              ),
+            const unit = buildAST(
+              addlParseResult.cst,
+              addlSource.fileName,
+              globalConstants,
             );
+            applyPragmas(unit, addlParseResult.pragmas, addlSource.fileName);
+            units.push(unit);
           } catch (e) {
             errors.push({
               message: `AST build failed for ${addlSource.fileName}: ${e instanceof Error ? e.message : String(e)}`,

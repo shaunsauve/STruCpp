@@ -140,6 +140,31 @@ export const ExternalPragma = createToken({
   line_breaks: true, // Content can span multiple lines
 });
 
+/** Pragmas marking generated code: `{strucpp generated}`, `_begin`, `_end`. */
+const GENERATED_PRAGMA_RE =
+  /\{\s*strucpp\s+(generated_begin|generated_end|generated)\s*\}/iy;
+
+function matchGeneratedPragma(
+  text: string,
+  startOffset: number,
+): RegExpExecArray | null {
+  if (text.charAt(startOffset) !== "{") return null;
+  GENERATED_PRAGMA_RE.lastIndex = startOffset;
+  return GENERATED_PRAGMA_RE.exec(text);
+}
+
+/**
+ * Generated-code pragma token. Kept out of the parser's token stream in the
+ * `pragmas` group; the compile pipeline reads it from there.
+ */
+export const GeneratedPragma = createToken({
+  name: "GeneratedPragma",
+  pattern: matchGeneratedPragma,
+  line_breaks: false,
+  start_chars_hint: ["{"],
+  group: "pragmas",
+});
+
 // =============================================================================
 // Nested Comment Support
 // =============================================================================
@@ -782,6 +807,7 @@ export const allTokens = [
 
   // External code pragma
   ExternalPragma,
+  GeneratedPragma,
 
   // Multi-character operators (before single-character)
   DoubleDot,
