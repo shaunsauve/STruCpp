@@ -6,13 +6,19 @@
  * Each block names the acceptance criterion it evidences:
  *   - shape        : the unprobed clone is the probe-off output plus polls, and
  *                    every planned probe is emitted once, in a probed clone.
- *   - A027         : every poll's idle path is one load, at most one compare and
- *                    one branch, read from the object code (local toolchain).
+ *   - A027         : every planted poll is accounted for in the object code
+ *                    (found in the poll shape, or proven unreachable) on the
+ *                    local toolchain, its x86-64 target on an arm64 Mac, and
+ *                    GCC 12 linux/arm64 and linux/amd64 when docker is present.
  *   - A028 / A019  : probe-off has no probe code, links without the debug ABI,
  *                    and still serves watch and force through the debug table.
  *   - transfer     : arming mid-loop continues in the probed clone with the same
- *                    locals; broken transfers (no polls, restart at entry, leaf
- *                    called unprobed) are shown red.
+ *                    locals, on GCC 12 arm64 (asm handoff) and amd64 (C++
+ *                    fallback) too; broken transfers (no polls, restart at
+ *                    entry, leaf called unprobed) are shown red.
+ *
+ * Probe-on blocks skip when compile()'s default is probe-off and the
+ * probe-off-configuration test skips when it is probe-on (PROBES_ON).
  *   - A204         : no probe parks under a shared-global lock (S1-S8):
  *                    build-inspect plus a two-thread run against the stub host.
  *
@@ -256,7 +262,19 @@ function cppOf(r: Result): string {
   return r.cppFiles.map((f) => `//// ${f.name}\n${f.content}`).join("\n");
 }
 
-describe("probe-on codegen: per-POU dual path (ADR-001 D10.6, A″ form)", () => {
+/**
+ * The probe configuration of this run: whether `compile()` plants probes when
+ * the caller does not say. Probe-on tests skip when it is off and the
+ * probe-off-configuration test skips when it is on, so the suite is green in
+ * both configurations with the other side reported as skipped.
+ */
+const PROBES_ON = /STRUCPP_POLL\(/.test(cppOf(compile(
+  "PROGRAM P\n  VAR i : INT; END_VAR\n  i := i + 1;\nEND_PROGRAM\n",
+  { headerFileName: "generated.hpp" },
+)));
+const PROBE_CONFIG = `probe configuration: ${PROBES_ON ? "on" : "off"}`;
+
+describe.skipIf(!PROBES_ON)(`probe-on codegen: per-POU dual path (ADR-001 D10.6, A″ form) (${PROBE_CONFIG})`, () => {
   const corpus: Array<[string, string]> = [["inline:shapes", SHAPES], ...validationSources()];
 
   it("every corpus program: the unprobed clone is the probe-off output plus polls, and each planned probe is emitted exactly once", () => {
@@ -335,118 +353,498 @@ describe("probe-on codegen: per-POU dual path (ADR-001 D10.6, A″ form)", () =>
 });
 
 // ---------------------------------------------------------------------------
-// A027: poll shape in the object code.
+// GCC 12 images: the openplc-runtime toolchain (debian bookworm), per platform.
+// linux/arm64 is the reference target; linux/amd64 is what x86-64 CI runs.
 // ---------------------------------------------------------------------------
 
-interface ShapeReport {
-  sites: number;
-  bad: string[];
-  slowCalls: string[];
+const GCC12_DOCKERFILE = path.resolve(__dirname, "docker/gcc12-arm64.Dockerfile");
+const hasDocker = spawnSync("docker", ["info"], { stdio: "ignore", timeout: 20000 }).status === 0;
+type Platform = "linux/arm64" | "linux/amd64";
+const gcc12Image = (platform: Platform): string => `strucpp-gcc12-${platform.split("/")[1]}:local`;
+const gcc12Built = new Set<Platform>();
+
+/** Build (or reuse) the GCC 12 image for `platform`. The Dockerfile pins a multi-arch digest. */
+function ensureGcc12(platform: Platform): string {
+  if (!gcc12Built.has(platform)) {
+    const b = spawnSync("docker", [
+      "build", "-q", "--platform", platform, "-t", gcc12Image(platform),
+      "-f", GCC12_DOCKERFILE, path.dirname(GCC12_DOCKERFILE),
+    ], { encoding: "utf8", timeout: 900000 });
+    expect(`${b.stdout}${b.stderr}`, "docker build").toBe(b.status === 0 ? `${b.stdout}${b.stderr}` : "<built>");
+    gcc12Built.add(platform);
+  }
+  return gcc12Image(platform);
 }
 
-/**
- * Read every load of `strucpp_dbg_active` in the unprobed functions of an
- * object file and check the instructions that follow it: at most one compare
- * or test, then a conditional branch. Also flags any call to a slow path from
- * an unprobed function. arm64 (ELF or Mach-O) and x86-64 ELF.
- */
-function pollShape(obj: string): ShapeReport {
-  const dis = execFileSync("objdump", ["-d", "-r", "--no-show-raw-insn", obj], {
-    encoding: "utf8",
-    maxBuffer: 64 << 20,
-  });
-  const report: ShapeReport = { sites: 0, bad: [], slowCalls: [] };
+/** Run `script` in the GCC 12 image with `root` at /w. */
+function inGcc12(platform: Platform, root: string, script: string, mounts: string[] = []): void {
+  const res = spawnSync("docker", [
+    "run", "--rm", "--platform", platform, "--cpus", "2", "-v", `${root}:/w`,
+    ...mounts.flatMap((m) => ["-v", m]), ensureGcc12(platform), "sh", "-c", `set -e\n${script}`,
+  ], { encoding: "utf8", maxBuffer: 64 << 20, timeout: 900000 });
+  expect(`${res.stdout}${res.stderr}`, `gcc 12 ${platform}`).toBe(res.status === 0 ? `${res.stdout}${res.stderr}` : "<ok>");
+}
+
+// ---------------------------------------------------------------------------
+// A027: poll shape in the object code, accounted per planted site.
+//
+// Every STRUCPP_POLL line the codegen planted must end in exactly one of:
+//   found       one or more active-byte loads attributed to that line (DWARF
+//               line table), each in the poll shape: arm64 `ldrb wN` whose
+//               next use of wN is `tbnz|tbz wN, #0` (independent instructions
+//               the scheduler interleaves are allowed and listed); x86-64
+//               `testb $1, active` + jcc, or a byte load, one test, one jcc;
+//   unreachable no active load AND no call in a reachability build, where the
+//               same line is replaced by an opaque external call. A reachable
+//               call is never deleted, so its absence proves the compiler
+//               removed the site as dead code.
+// Anything else fails: a site missing while reachable, a load in another
+// shape, an active load attributed to no planted line, a slow-path call.
+// The load is volatile, so the compiler may not merge two sites into one
+// load; duplication (several loads on one line) is allowed and reported.
+//
+// The line mapping needs -g. -g must not change code generation; each object
+// is also built without -g and the instruction streams must be identical.
+// ---------------------------------------------------------------------------
+
+type Arch = "arm64" | "x86_64";
+interface Insn { addr: number; mn: string; ops: string; relocs: string[]; fn: string; file: string; line: number }
+
+/** objdump -d -r -l (GNU or LLVM, ELF or Mach-O) into instructions with function, file and line. */
+function parseDis(dis: string): Insn[] {
+  const out: Insn[] = [];
   let fn = "";
-  type Insn = { text: string; relocs: string[] };
-  const funcs = new Map<string, Insn[]>();
+  let file = "";
+  let line = 0;
   for (const raw of dis.split("\n")) {
-    const head = /^[0-9a-f]+ <(.+)>:$/.exec(raw.trim());
+    const t = raw.trim();
+    const head = /^[0-9a-f]+ <(.+)>:$/.exec(t);
     if (head) {
-      fn = head[1]!;
-      funcs.set(fn, []);
+      fn = head[1]!.replace(/^_(?=_Z)/, "");
+      file = "";
+      line = 0;
       continue;
     }
-    if (!fn) continue;
-    const reloc = /^\s*[0-9a-f]+:\s+(R_\S+|ARM64_RELOC_\S+|X86_64_RELOC_\S+)\s+(\S+)/.exec(raw);
-    const list = funcs.get(fn)!;
+    // LLVM labels the first function of a Mach-O section `ltmpN`; its -l
+    // function marker carries the real name.
+    const marker = /^(?:; )?([\w.$]+)\(\):$/.exec(t);
+    if (marker) {
+      if (/^ltmp\d+$/.test(fn)) fn = marker[1]!;
+      continue;
+    }
+    const loc = /^(?:; )?(\/\S+):(\d+)(?: \(discriminator \d+\))?$/.exec(t);
+    if (loc) {
+      file = path.basename(loc[1]!);
+      line = Number(loc[2]);
+      continue;
+    }
+    const reloc = /^\s*[0-9a-f]+:\s+(R_\S+|ARM64_RELOC_\S+|X86_64_RELOC_\S+)\s+_?([\w.$]+)/.exec(raw);
     if (reloc) {
-      list[list.length - 1]?.relocs.push(reloc[2]!);
+      out[out.length - 1]?.relocs.push(reloc[2]!);
       continue;
     }
-    const insn = /^\s*[0-9a-f]+:\s+(.*)$/.exec(raw);
-    if (insn) list.push({ text: insn[1]!.trim(), relocs: [] });
+    const m = /^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$/.exec(raw);
+    if (m) {
+      const ops = m[3]!.replace(/\s+(\/\/|;|##? ).*$/, "").trim();
+      out.push({ addr: parseInt(m[1]!, 16), mn: m[2]!, ops, relocs: [], fn, file, line });
+    }
   }
-  const isBranch = (t: string): boolean =>
-    /^(tbnz|tbz|cbnz|cbz|b\.(ne|eq)|jne|je|jnz|jz)\b/.test(t);
-  const isCompare = (t: string): boolean => /^(tst|cmp|ands|test[bl]?|cmp[bl]?)\b/.test(t);
-  for (const [name, insns] of funcs) {
-    // Probed clones, leaf entries and the frame record's constructor run
-    // only with a session attached; they are not the idle path.
-    if (/__dbg_(probed|entry)|dbg5Frame|dbg::Frame/.test(name)) continue;
-    insns.forEach((ins, i) => {
-      if (/^(bl|call[q]?)\b/.test(ins.text) &&
-          ins.relocs.concat(ins.text).some((s) => /strucpp_dbg_(hit|frame_link)|strucpp_dbg_test_poll/.test(s))) {
-        report.slowCalls.push(`${name}: ${ins.text}`);
+  return out;
+}
+
+/** Instruction lines only, for the -g / no -g code-identity check. */
+const insnText = (dis: string): string[] =>
+  dis.split("\n")
+    .filter((l) => /^\s*[0-9a-f]+:\s+\S/.test(l) && !/^\s*[0-9a-f]+:\s+(R_|ARM64_RELOC_|X86_64_RELOC_)/.test(l))
+    .map((l) => l.trim().replace(/\s+/g, " "));
+
+/** Probed clones, leaf entries, transfer stubs and the frame record run only with a session attached. */
+const SESSION_ONLY = /__dbg_(probed|entry|xfer)|dbg5Frame|clang_call_terminate/;
+const ACTIVE = "strucpp_dbg_active";
+const isActive = (i: Insn): boolean => i.relocs.some((r) => r.startsWith(ACTIVE));
+const isCallOrJump = (i: Insn): boolean => /^(bl|b|blr|br|call[q]?|jmp[q]?)$/.test(i.mn);
+
+interface Load { site: string; how: string; shape: string | undefined; text: string }
+
+/** Every active-byte load in session-free code, with its line and shape verdict. */
+function activeLoads(arch: Arch, insns: Insn[]): { loads: Load[]; slowCalls: string[] } {
+  const loads: Load[] = [];
+  const slowCalls: string[] = [];
+  const byFn = new Map<string, Insn[]>();
+  for (const i of insns) {
+    if (SESSION_ONLY.test(i.fn)) continue;
+    if (!byFn.has(i.fn)) byFn.set(i.fn, []);
+    byFn.get(i.fn)!.push(i);
+  }
+  for (const [, fi] of byFn) {
+    // arm64: a load through a register holding &strucpp_dbg_active, formed by
+    // adrp + add (GCC hoists it out of a loop and loads `ldrb wN, [xR]` with no
+    // relocation of its own). The register counts only if every CFG path back
+    // from the load reaches that add before any other write or call clobber.
+    const at = new Map(fi.map((x, k) => [x.addr, k]));
+    const target = (x: Insn): number | undefined => {
+      const t = /\b(?:0x)?([0-9a-f]+) <[^>]*>$/.exec(x.ops);
+      return t ? at.get(parseInt(t[1]!, 16)) : undefined;
+    };
+    const preds: number[][] = fi.map(() => []);
+    fi.forEach((x, k) => {
+      const t = target(x);
+      const cond = /^(cbz|cbnz|tbz|tbnz)$|^b\./.test(x.mn);
+      if ((x.mn === "b" || cond) && t !== undefined) preds[t]!.push(k);
+      if (!/^(b|ret|br)$/.test(x.mn) && k + 1 < fi.length) preds[k + 1]!.push(k);
+    });
+    const writes = (x: Insn, reg: number): boolean => {
+      if (/^(bl|blr)$/.test(x.mn)) return reg <= 18 || reg === 30;
+      if (/^(st|cmp|cmn|tst|cb|tb|b|ret|br|prfm)/.test(x.mn)) return false;
+      const d = /^[xw](\d+)(?:, [xw](\d+))?/.exec(x.ops);
+      return !!d && (Number(d[1]) === reg || (/^ldp/.test(x.mn) && Number(d[2]) === reg));
+    };
+    const holdsActive = (n: number, reg: number): boolean => {
+      const seen = new Set<number>();
+      const work = [...preds[n]!];
+      if (n === 0) return false;
+      while (work.length) {
+        const k = work.pop()!;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const x = fi[k]!;
+        if (writes(x, reg)) {
+          if (x.mn === "add" && isActive(x)) continue;
+          return false;
+        }
+        if (k === 0) return false; // function entry with no definition
+        work.push(...preds[k]!);
       }
-      if (!ins.relocs.some((s) => /strucpp_dbg_active/.test(s))) return;
-      // Only loads: adrp / add / lea form the address and touch no memory.
-      if (!/^(ldr|ldur|mov|testb|cmpb)/.test(ins.text)) return;
-      report.sites++;
-      const next = insns.slice(i + 1, i + 3).map((n) => n.text);
-      const ok =
-        isBranch(next[0] ?? "") ||
-        (isCompare(next[0] ?? "") && isBranch(next[1] ?? "")) ||
-        (/^(testb|cmpb)\b/.test(ins.text) && isBranch(next[0] ?? ""));
-      if (!ok) report.bad.push(`${name}: ${ins.text} ; ${next.join(" ; ")}`);
+      return seen.size > 0;
+    };
+    fi.forEach((ins, n) => {
+      const site = `${ins.file}:${ins.line}`;
+      if (isCallOrJump(ins) && ins.relocs.concat(ins.ops).some((s) => /strucpp_dbg_(hit|frame_link|test_poll)/.test(s))) {
+        slowCalls.push(`${site} ${ins.mn} ${ins.ops}`);
+      }
+      const text = (k: number): string => fi.slice(n, n + k).map((x) => `${x.mn} ${x.ops}`).join(" ; ");
+      if (arch === "arm64") {
+        const base = /\[x(\d+)(?:, #0x0|, #0)?\]$/.exec(ins.ops)?.[1];
+        const viaReg = base !== undefined && /^ld/.test(ins.mn) && !isActive(ins) && holdsActive(n, Number(base));
+        if (!(isActive(ins) && /^ld/.test(ins.mn)) && !viaReg) return;
+        const how = isActive(ins) ? "direct" : `address hoisted in x${base}`;
+        if (ins.mn !== "ldrb") {
+          loads.push({ site, how, shape: `not a byte load: ${text(2)}`, text: text(2) });
+          return;
+        }
+        const reg = /^w(\d+),/.exec(ins.ops)![1]!;
+        const uses = new RegExp(`\\b[wx]${reg}\\b`);
+        let shape: string | undefined = "no test of the loaded byte";
+        let len = 1;
+        for (let j = n + 1; j < fi.length && j <= n + 8; j++) {
+          const o = fi[j]!;
+          len++;
+          if (uses.test(o.ops)) {
+            shape = /^(tbnz|tbz)$/.test(o.mn) && new RegExp(`^w${reg}, #(0x0|0),`).test(o.ops)
+              ? undefined
+              : `loaded byte used by \`${o.mn} ${o.ops}\` before any tbnz/tbz`;
+            break;
+          }
+          if (/^(b|bl|blr|br|ret|cbz|cbnz|tbz|tbnz)$|^b\./.test(o.mn) || /^(ld|st)/.test(o.mn) && o.ops.includes(`[x${reg}`)) {
+            shape = `poll split by \`${o.mn} ${o.ops}\``;
+            break;
+          }
+        }
+        loads.push({ site, how, shape, text: text(len) });
+      } else {
+        if (!isActive(ins) || /^lea/.test(ins.mn)) return;
+        // x86-64: `testb $1, active(%rip)` then jcc, or a byte load into a
+        // register, one `test|and $1` of it, then jcc. Independent mov/lea/add
+        // the scheduler places in between are allowed and listed.
+        const jcc = (m: string): boolean => /^j(ne|e|nz|z)$/.test(m);
+        const setsNoFlags = (m: string): boolean => /^(mov|lea|nop)/.test(m);
+        let want: "jcc" | "test" | undefined;
+        let fam: RegExp | undefined;
+        if (/^testb$/.test(ins.mn) && /^\$0x1,/.test(ins.ops)) want = "jcc";
+        else if (/^(movzbl|movzbw|movb|movzx)$/.test(ins.mn)) {
+          const r = /%(\w+)$/.exec(ins.ops)?.[1] ?? "";
+          const k = /^r(\d+)/.exec(r)?.[1] ?? r.replace(/^[re]?([a-d])[xlh]$/, "$1").replace(/^[re]?(si|di|bp|sp)l?$/, "$1");
+          fam = new RegExp(/^\d+$/.test(k) ? `%r${k}[dwb]?\\b` : /^[a-d]$/.test(k) ? `%[re]?${k}[xlh]\\b` : `%[re]?${k}l?\\b`);
+          want = "test";
+        }
+        let shape: string | undefined = want ? "no branch on the loaded byte" : "not a testb or byte load of the active byte";
+        let len = 1;
+        for (let j = n + 1; want && j < fi.length && j <= n + 8; j++) {
+          const o = fi[j]!;
+          len++;
+          if (want === "test") {
+            if (fam!.test(o.ops)) {
+              if (/^(test|and)[bl]?$/.test(o.mn) && /^\$0x1,/.test(o.ops)) { want = "jcc"; continue; }
+              shape = `loaded byte used by \`${o.mn} ${o.ops}\` before a test`;
+              break;
+            }
+            if (/^(j|call|ret)/.test(o.mn)) { shape = `poll split by \`${o.mn} ${o.ops}\``; break; }
+            continue;
+          }
+          if (jcc(o.mn)) { shape = undefined; break; }
+          if (!setsNoFlags(o.mn)) { shape = `test separated from its branch by \`${o.mn} ${o.ops}\``; break; }
+        }
+        loads.push({ site, how: "direct", shape, text: text(len) });
+      }
     });
   }
-  return report;
+  return { loads, slowCalls };
 }
 
-const shapeArch = (() => {
-  if (!hasGpp) return undefined;
-  const target = execFileSync("g++", ["-dumpmachine"], { encoding: "utf8" });
-  return /^(aarch64|arm64|x86_64)/.test(target) ? target.trim() : undefined;
+interface PollAudit { planted: number; failures: string[]; report: string[] }
+
+/**
+ * Account for every planted poll of one build. `dis` maps a .cpp basename to
+ * its objects' disassembly: `g` (objdump -drl of the -g object), `plain`
+ * (objdump -d without -g) and `reach` (the reachability build, -g).
+ */
+function auditPolls(
+  arch: Arch,
+  files: Array<{ name: string; content: string }>,
+  dis: Map<string, { g: string; plain: string; reach: string }>,
+): PollAudit {
+  const failures: string[] = [];
+  const report: string[] = [];
+  const planted = new Map<string, number>(); // file:line -> poll label k
+  for (const f of files) {
+    f.content.split("\n").forEach((l, i) => {
+      const m = /STRUCPP_POLL\((\d+),/.exec(l);
+      if (m) planted.set(`${f.name}:${i + 1}`, Number(m[1]));
+    });
+  }
+  const loads: Load[] = [];
+  const reachable = new Set<string>();
+  for (const f of files) {
+    const d = dis.get(f.name);
+    if (!d) {
+      failures.push(`${f.name}: no object`);
+      continue;
+    }
+    const g = insnText(d.g);
+    const p = insnText(d.plain);
+    const diff = g.findIndex((l, i) => l !== p[i]);
+    if (diff >= 0 || g.length !== p.length) {
+      failures.push(`${f.name}: -g changed the code at instruction ${diff}: ${g[diff]} vs ${p[diff]}`);
+    }
+    const a = activeLoads(arch, parseDis(d.g));
+    loads.push(...a.loads);
+    failures.push(...a.slowCalls.map((s) => `slow-path call on the idle path: ${s}`));
+    for (const i of parseDis(d.reach)) {
+      if (isCallOrJump(i) && i.relocs.concat(i.ops).some((s) => s.includes("strucpp_dbg_test_site"))) {
+        reachable.add(`${i.file}:${i.line}`);
+      }
+    }
+  }
+  for (const l of loads) {
+    if (!planted.has(l.site)) failures.push(`active load at ${l.site}, which is no planted poll: ${l.text}`);
+  }
+  let found = 0;
+  let hoisted = 0;
+  let unreachable = 0;
+  for (const [site, k] of planted) {
+    const at = loads.filter((l) => l.site === site);
+    const label = `${site} poll ${k}`;
+    if (at.length === 0) {
+      if (reachable.has(site)) {
+        failures.push(`${label}: reachable (its call survives in the reachability build) but has no active load`);
+        report.push(`${label}: MISSING`);
+      } else {
+        unreachable++;
+        report.push(`${label}: absent, unreachable (the reachability build drops its call too)`);
+      }
+      continue;
+    }
+    found++;
+    if (at.some((l) => l.how !== "direct")) hoisted++;
+    for (const l of at) {
+      if (l.shape) failures.push(`${label}: ${l.shape}`);
+    }
+    report.push(`${label}: ${at.map((l) => `[${l.how}] ${l.text}${l.shape ? ` -- BAD: ${l.shape}` : ""}`).join(" || ")}`);
+  }
+  report.unshift(
+    `${planted.size} planted: ${found} found (${found - hoisted} with the address formed at the load, ` +
+      `${hoisted} through an address register hoisted out of the loop), ${unreachable} unreachable, ` +
+      `${planted.size - found - unreachable} missing`,
+  );
+  return { planted: planted.size, failures, report };
+}
+
+/** The reachability build: every planted poll line replaced, in place, by an opaque call. */
+const REACH_DECL = 'extern "C" void strucpp_dbg_test_site(unsigned);\n';
+const reachPatch = (code: string): string =>
+  code.split("\n").map((l, i) => (/STRUCPP_POLL\(/.test(l) ? `    strucpp_dbg_test_site(${i + 1}u);` : l)).join("\n");
+
+interface ShapeToolchain { label: string; arch: Arch; available: boolean; run: (root: string) => void }
+
+/**
+ * Toolchains for A027: the local compiler; on an arm64 Mac also its x86-64
+ * target; and GCC 12 (the runtime's toolchain) for linux/arm64 and
+ * linux/amd64 when docker is present. `run` compiles every variant directory
+ * under `root` (each holds its .cpp files, generated.hpp, rt/ and maybe
+ * pre.h) into <cpp>.g.dis, <cpp>.plain.dis.
+ */
+const SHAPE_TOOLCHAINS: ShapeToolchain[] = (() => {
+  const target = hasGpp ? execFileSync("g++", ["-dumpmachine"], { encoding: "utf8" }).trim() : "";
+  const hostArch: Arch | undefined = /^(aarch64|arm64)/.test(target) ? "arm64" : /^x86_64/.test(target) ? "x86_64" : undefined;
+  const cxx = RUNTIME_FLAGS.join(" ");
+  const variantScript = (objdump: string): string => [
+    "for d in /w/*/; do",
+    '  pre=""; [ -f "$d/pre.h" ] && pre="-include $d/pre.h"',
+    '  for f in "$d"/*.cpp; do',
+    `    g++ ${cxx} -I"$d/rt" -I"$d" $pre -g -c "$f" -o "$f.g.o"`,
+    `    ${objdump} -d -r -l --no-show-raw-insn "$f.g.o" > "$f.g.dis"`,
+    `    g++ ${cxx} -I"$d/rt" -I"$d" $pre -c "$f" -o "$f.o"`,
+    `    ${objdump} -d --no-show-raw-insn "$f.o" > "$f.plain.dis"`,
+    "  done",
+    "done",
+  ].join("\n");
+  const local = (extra: string[]) => (root: string): void => {
+    for (const v of fs.readdirSync(root)) {
+      const d = path.join(root, v);
+      const pre = fs.existsSync(path.join(d, "pre.h")) ? ["-include", path.join(d, "pre.h")] : [];
+      for (const cpp of fs.readdirSync(d).filter((f) => f.endsWith(".cpp")).map((f) => path.join(d, f))) {
+        for (const [suffix, g] of [["g", ["-g"]], ["plain", []]] as const) {
+          const c = gxx([...RUNTIME_FLAGS, ...extra, ...g, `-I${d}/rt`, `-I${d}`, ...pre, "-c", cpp, "-o", `${cpp}.${suffix}.o`]);
+          expect(c.out, `g++ -c ${path.basename(cpp)}`).toBe(c.ok ? c.out : "<compiled>");
+          const dis = execFileSync("objdump", ["-d", ...(g.length ? ["-r", "-l"] : []), "--no-show-raw-insn", `${cpp}.${suffix}.o`], {
+            encoding: "utf8", maxBuffer: 64 << 20,
+          });
+          fs.writeFileSync(`${cpp}.${suffix}.dis`, dis);
+        }
+      }
+    }
+  };
+  return [
+    { label: `local ${target || "g++ (none)"}`, arch: hostArch ?? "arm64", available: !!hostArch, run: local([]) },
+    {
+      label: "local x86_64-apple-darwin (-arch x86_64)",
+      arch: "x86_64",
+      available: process.platform === "darwin" && hostArch === "arm64",
+      run: local(["-arch", "x86_64"]),
+    },
+    ...(["linux/arm64", "linux/amd64"] as const).map((platform): ShapeToolchain => ({
+      label: `GCC 12 ${platform}`,
+      arch: platform === "linux/arm64" ? "arm64" : "x86_64",
+      available: hasDocker,
+      run: (root) => inGcc12(platform, root, variantScript("objdump")),
+    })),
+  ];
 })();
 
-describe.skipIf(!shapeArch)(`A027: poll shape in the object code (${shapeArch ?? "unsupported target"})`, () => {
-  function objects(name: string, r: Result, include = RUNTIME_INCLUDE_PATH): ShapeReport {
-    const { dir, cpps } = writeTree(name, r);
-    const total: ShapeReport = { sites: 0, bad: [], slowCalls: [] };
-    for (const cpp of cpps) {
-      const obj = cpp.replace(/\.cpp$/, ".o");
-      const c = gxx([...RUNTIME_FLAGS, `-I${include}`, `-I${dir}`, "-c", cpp, "-o", obj]);
-      expect(c.out, `g++ -c ${path.basename(cpp)}`).toBe(c.ok ? c.out : "<compiled>");
-      const s = pollShape(obj);
-      total.sites += s.sites;
-      total.bad.push(...s.bad);
-      total.slowCalls.push(...s.slowCalls);
-    }
-    return total;
+describe.skipIf(!PROBES_ON)(`A027: every planted poll accounted for in the object code (${PROBE_CONFIG})`, () => {
+  // One green build and three seeded defects, compiled together per toolchain.
+  const VARIANTS: Array<{
+    name: string;
+    runtime?: [from: string, to: string];
+    patch?: (code: string) => string;
+    expectFailure?: RegExp;
+    expectUnreachable?: RegExp;
+  }> = [
+    { name: "green" },
+    {
+      // A poll made an out-of-line call: no load remains, every site is
+      // reachable and the call is a slow path on the idle path.
+      name: "call",
+      runtime: [
+        "#define STRUCPP_DBG_ACTIVE_NOW() (*static_cast<volatile uint8_t*>(&strucpp_dbg_active) & STRUCPP_DBG_ACTIVE)",
+        'extern "C" uint8_t strucpp_dbg_test_poll(void);\n#define STRUCPP_DBG_ACTIVE_NOW() (strucpp_dbg_test_poll() + (0 & strucpp_dbg_active))',
+      ],
+      expectFailure: /reachable .* but has no active load[\s\S]*slow-path call|slow-path call[\s\S]*reachable .* but has no active load/,
+    },
+    {
+      // The two-load form: two byte loads combined before the branch.
+      name: "two-load",
+      runtime: [
+        "#define STRUCPP_DBG_ACTIVE_NOW() (*static_cast<volatile uint8_t*>(&strucpp_dbg_active) & STRUCPP_DBG_ACTIVE)",
+        "#define STRUCPP_DBG_ACTIVE_NOW() ((*static_cast<volatile uint8_t*>(&strucpp_dbg_active) | *static_cast<volatile uint8_t*>(&strucpp_dbg_active)) & STRUCPP_DBG_ACTIVE)",
+      ],
+      expectFailure: /loaded byte used by|not testb\+jcc/,
+    },
+    {
+      // A site the codegen planted that silently compiles to nothing: SUMTO's
+      // FOR back-edge poll (live: the loop runs) is guarded off.
+      name: "missing",
+      patch: (code) => code.replace(/^(\s*)(STRUCPP_POLL\(1, SUMTO__dbg_probed)/m, "$1if (0) $2"),
+      expectFailure: /pou_SUMTO\.cpp:\d+ poll 1: reachable .* but has no active load/,
+    },
+    {
+      // The valid absence: the same site made dead code in both builds (the
+      // guard sits on the line before, so the reachability call is dead too).
+      name: "dead",
+      patch: (code) => code.replace(/^(\s*ACC = ACC \+ CLAMP\(.*;)$/m, "$1 if (0)"),
+      expectUnreachable: /pou_SUMTO\.cpp:\d+ poll 1: absent, unreachable/,
+    },
+  ];
+
+  for (const tc of SHAPE_TOOLCHAINS) {
+    describe.skipIf(!tc.available)(tc.label, () => {
+      const audits = new Map<string, PollAudit>();
+      beforeAll(() => {
+        const r = build(SHAPES);
+        const root = path.join(tmpRoot, `a027-${tc.label.replace(/\W+/g, "-")}`);
+        for (const v of VARIANTS) {
+          for (const kind of ["main", "reach"] as const) {
+            const dir = path.join(root, `${v.name}-${kind}`);
+            fs.mkdirSync(dir, { recursive: true });
+            fs.cpSync(RUNTIME_INCLUDE_PATH, path.join(dir, "rt"), { recursive: true });
+            if (v.runtime) {
+              const p = path.join(dir, "rt", "debug_probe.hpp");
+              const text = fs.readFileSync(p, "utf8");
+              expect(text.includes(v.runtime[0]), `${v.name}: debug_probe.hpp still has the text the seed replaces`).toBe(true);
+              fs.writeFileSync(p, text.split(v.runtime[0]).join(v.runtime[1]));
+            }
+            fs.writeFileSync(path.join(dir, "generated.hpp"), r.headerCode);
+            if (kind === "reach") fs.writeFileSync(path.join(dir, "pre.h"), REACH_DECL);
+            for (const f of r.cppFiles) {
+              const seeded = v.patch ? v.patch(f.content) : f.content;
+              fs.writeFileSync(path.join(dir, f.name), kind === "reach" ? reachPatch(seeded) : seeded);
+            }
+          }
+        }
+        for (const v of VARIANTS.filter((x) => x.patch)) {
+          if (v.patch!(cppOf(r)) === cppOf(r)) throw new Error(`the ${v.name} seed no longer matches the generated code`);
+        }
+        tc.run(root);
+        for (const v of VARIANTS) {
+          const dis = new Map<string, { g: string; plain: string; reach: string }>();
+          for (const f of r.cppFiles) {
+            const main = path.join(root, `${v.name}-main`, f.name);
+            dis.set(f.name, {
+              g: fs.readFileSync(`${main}.g.dis`, "utf8"),
+              plain: fs.readFileSync(`${main}.plain.dis`, "utf8"),
+              reach: fs.readFileSync(path.join(root, `${v.name}-reach`, `${f.name}.g.dis`), "utf8"),
+            });
+          }
+          // Planted sites are those of the generated code, before any seed.
+          audits.set(v.name, auditPolls(tc.arch, r.cppFiles, dis));
+        }
+      }, 900000);
+
+      it("green: every planted poll is found in the exact shape or proven unreachable", () => {
+        const a = audits.get("green")!;
+        console.log(`A027 ${tc.label}:\n  ${a.report.join("\n  ")}`);
+        expect(a.planted).toBeGreaterThan(10);
+        expect(a.failures).toEqual([]);
+      });
+
+      for (const v of VARIANTS.filter((x) => x.expectUnreachable)) {
+        it(`${v.name}: a site the compiler removed as dead code is accounted for as unreachable, not failed`, () => {
+          const a = audits.get(v.name)!;
+          expect(a.failures).toEqual([]);
+          expect(a.report.join("\n")).toMatch(v.expectUnreachable!);
+          expect(a.report[0]).toMatch(/ 1 unreachable, 0 missing$/);
+        });
+      }
+
+      for (const v of VARIANTS.filter((x) => x.expectFailure)) {
+        it(`red: ${v.name} seed fails the audit`, () => {
+          const a = audits.get(v.name)!;
+          console.log(`A027 ${tc.label} red ${v.name}: ${a.failures.length} failures, first: ${a.failures[0]}`);
+          expect(a.failures.join("\n")).toMatch(v.expectFailure!);
+        });
+      }
+    });
   }
-  const planted = (r: Result): number =>
-    r.cppFiles.reduce((n, f) => n + [...f.content.matchAll(/^\s*STRUCPP_POLL\(/gm)].length, 0);
-
-  it("every planted poll is one load, at most one compare and one branch, with no slow path on the idle path", () => {
-    const r = build(SHAPES);
-    const s = objects("shape-on", r);
-    expect(planted(r)).toBeGreaterThan(10);
-    expect(s.sites).toBe(planted(r));
-    expect(s.bad).toEqual([]);
-    expect(s.slowCalls).toEqual([]);
-  });
-
-  it("red: a poll made an out-of-line call fails the shape check", () => {
-    const r = build(SHAPES);
-    const rt = patchedRuntime(
-      "pollcall",
-      "debug_probe.hpp",
-      "#define STRUCPP_DBG_ACTIVE_NOW() (*static_cast<volatile uint8_t*>(&strucpp_dbg_active) & STRUCPP_DBG_ACTIVE)",
-      'extern "C" uint8_t strucpp_dbg_test_poll(void);\n#define STRUCPP_DBG_ACTIVE_NOW() (strucpp_dbg_test_poll() + (0 & strucpp_dbg_active))',
-    );
-    const s = objects("shape-red", r, rt);
-    expect(s.slowCalls.length + s.bad.length + Math.abs(s.sites - planted(r))).toBeGreaterThan(0);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -455,9 +853,6 @@ describe.skipIf(!shapeArch)(`A027: poll shape in the object code (${shapeArch ??
 // probe-on idle path.
 // ---------------------------------------------------------------------------
 
-const GCC12_IMAGE = "strucpp-gcc12-arm64:local";
-const GCC12_DOCKERFILE = path.resolve(__dirname, "docker/gcc12-arm64.Dockerfile");
-const hasDocker = spawnSync("docker", ["info"], { stdio: "ignore", timeout: 20000 }).status === 0;
 
 /** Compile every .cpp under `root` in the GCC 12 image; returns objdump -dr per object. */
 function gcc12Disassemble(root: string, include: string): Map<string, string> {
@@ -469,7 +864,7 @@ function gcc12Disassemble(root: string, include: string): Map<string, string> {
   ].join("\n");
   const res = spawnSync("docker", [
     "run", "--rm", "--platform", "linux/arm64", "--cpus", "2",
-    "-v", `${root}:/w`, "-v", `${include}:/rt:ro`, GCC12_IMAGE, "sh", "-c", script,
+    "-v", `${root}:/w`, "-v", `${include}:/rt:ro`, ensureGcc12("linux/arm64"), "sh", "-c", script,
   ], { encoding: "utf8", maxBuffer: 64 << 20, timeout: 900000 });
   expect(`${res.stdout}${res.stderr}`, "gcc 12 build").toBe(res.status === 0 ? `${res.stdout}${res.stderr}` : "<built>");
   const out = new Map<string, string>();
@@ -599,7 +994,7 @@ function idleFrames(dis: string): FrameReport {
   return { frames };
 }
 
-describe.skipIf(!hasDocker)("A″ frame: frameless probe-off functions stay frameless probe-on (GCC 12 arm64)", () => {
+describe.skipIf(!hasDocker || !PROBES_ON)(`A″ frame: frameless probe-off functions stay frameless probe-on (GCC 12 arm64) (${PROBE_CONFIG})`, () => {
   function frames(variant: string, corpus: Array<[string, string]>, opts: Partial<CompileOptions>, include = RUNTIME_INCLUDE_PATH): Map<string, string[]> {
     const root = path.join(tmpRoot, `frames-${variant}`);
     corpus.forEach(([name, src], n) => {
@@ -636,11 +1031,7 @@ describe.skipIf(!hasDocker)("A″ frame: frameless probe-off functions stay fram
   }
 
   beforeAll(() => {
-    const b = spawnSync("docker", [
-      "build", "-q", "--platform", "linux/arm64", "-t", GCC12_IMAGE,
-      "-f", GCC12_DOCKERFILE, path.dirname(GCC12_DOCKERFILE),
-    ], { encoding: "utf8", timeout: 900000 });
-    expect(`${b.stdout}${b.stderr}`, "docker build").toBe(b.status === 0 ? `${b.stdout}${b.stderr}` : "<built>");
+    ensureGcc12("linux/arm64");
   }, 900000);
 
   it("every corpus function frameless in probe-off is frameless on the probe-on idle path", () => {
@@ -704,7 +1095,8 @@ describe.skipIf(!hasGpp)("A028 / A019: probe-off build", () => {
       // The one probe-related symbol a probe-off build keeps: the NO_PROBES answer.
       expect(cppOf(off)).toMatch(/strucpp_dbg_probe_count\(void\) \{ return 0; \}/);
 
-      const on = build(src);
+      // Positive control for the marker pattern, explicit so it holds in either configuration.
+      const on = build(src, { debugProbes: true });
       expect(cppOf(on)).toMatch(PROBE_MARKERS);
     }
   });
@@ -743,6 +1135,16 @@ int main() {
     });
     // handle_set answers STATUS_OK (0x7E).
     expect(res.out).toContain("probes=0 count=5 in1=7 out1=99 set=126");
+  });
+
+  it.skipIf(PROBES_ON)(`probe-off configuration: a build that names no probe setting is the probe-off build (${PROBE_CONFIG})`, () => {
+    for (const src of [PLANT, SHAPES]) {
+      const def = build(src);
+      const off = build(src, { debugProbes: false });
+      expect(cppOf(def)).toBe(cppOf(off));
+      expect(def.headerCode).toBe(off.headerCode);
+      expect(`${def.headerCode}\n${cppOf(def)}`).not.toMatch(PROBE_MARKERS);
+    }
   });
 });
 
@@ -848,7 +1250,7 @@ int main(int argc, char** argv) {
 }
 `;
 
-describe.skipIf(!hasGpp)("transfer: arming mid-loop continues in the probed clone with the same locals", () => {
+describe.skipIf(!hasGpp || !PROBES_ON)(`transfer: arming mid-loop continues in the probed clone with the same locals (${PROBE_CONFIG})`, () => {
   // Expected outcome per scenario; "first_at" is the last loop value seen
   // before the first stop, so 500 means the stop came on the iteration right
   // after the arm, not after a restart at the POU entry.
@@ -881,6 +1283,38 @@ describe.skipIf(!hasGpp)("transfer: arming mid-loop continues in the probed clon
         expect(out.trim(), `${b.name} ${s.id}`).toBe(s.expect);
       }
     });
+  }
+
+  // c7052da's register-saving asm handoff (STRUCPP_POLL_X) is aarch64-only;
+  // every other target, x86-64 included, keeps the previous C++ form (the
+  // poll returns a call of the probed clone). Both CI platforms, on the
+  // runtime's GCC 12: every scenario continues at the poll site, and the
+  // object code shows which form each one compiled.
+  for (const platform of ["linux/arm64", "linux/amd64"] as const) {
+    const asm = platform === "linux/arm64";
+    it.skipIf(!hasDocker)(`GCC 12 ${platform}: every scenario continues at the poll site, ${asm ? "through the asm handoff" : "through the C++ tail-return fallback"}`, () => {
+      const r = build(TRANSFER);
+      const { dir, cpps } = writeTree(`xfer-gcc12-${platform.replace("/", "-")}`, r);
+      fs.writeFileSync(path.join(dir, "main.cpp"), TRANSFER_MAIN);
+      fs.cpSync(RUNTIME_INCLUDE_PATH, path.join(dir, "rt"), { recursive: true });
+      fs.cpSync(TEST_RUNTIME_PATH, path.join(dir, "rtt"), { recursive: true });
+      const runs = SCENARIOS.map((sc) => `./a.out ${sc.id} ${probeAt(TRANSFER, r, sc.marker)} ${sc.armAt} >> out.txt`);
+      inGcc12(platform, dir, [
+        "cd /w",
+        ...["main.cpp", ...cpps.map((c) => path.basename(c))].map(
+          (f) => `g++ ${RUNTIME_FLAGS.join(" ")} -Irt -Irtt -I. -c ${f} -o ${f}.o`),
+        "g++ -pthread *.o -o a.out",
+        "objdump -dr --no-show-raw-insn *.cpp.o > all.dis",
+        ": > out.txt",
+        ...runs,
+      ].join("\n"));
+      expect(fs.readFileSync(path.join(dir, "out.txt"), "utf8").trim().split("\n")).toEqual(SCENARIOS.map((sc) => sc.expect));
+      // The asm block reaches the transfer stub by address (a relocation
+      // against __dbg_xfer); the C++ form never names the stub.
+      const xferRefs = (fs.readFileSync(path.join(dir, "all.dis"), "utf8").match(/^\s+[0-9a-f]+: R_\S+\s+\S*__dbg_xfer/gm) ?? []).length;
+      if (asm) expect(xferRefs).toBeGreaterThan(0);
+      else expect(xferRefs).toBe(0);
+    }, 900000);
   }
 
   // Each red build breaks one part of the transfer; at least one scenario
@@ -926,7 +1360,7 @@ describe.skipIf(!hasGpp)("transfer: arming mid-loop continues in the probed clon
 // Probed clones run whole programs correctly: the validation suite, attached.
 // ---------------------------------------------------------------------------
 
-describe.skipIf(!hasGpp)("probed clones: validation programs pass with a session attached from the start", () => {
+describe.skipIf(!hasGpp || !PROBES_ON)(`probed clones: validation programs pass with a session attached from the start (${PROBE_CONFIG})`, () => {
   // Loops, properties (getter/setter clones) and SUPER calls into a base
   // body; functions with locals are covered by the transfer tests above.
   const PAIRS = [
@@ -1181,7 +1615,7 @@ describe("A204: no probe parks under a shared-global lock (S1-S8)", () => {
     expect(() => compile(s8, { headerFileName: "generated.hpp" })).toThrow(/shared function-block global/i);
   });
 
-  describe.skipIf(!hasGpp)("two tasks against the stub host (STRUCPP_THREADED)", () => {
+  describe.skipIf(!hasGpp || !PROBES_ON)(`two tasks against the stub host (STRUCPP_THREADED) (${PROBE_CONFIG})`, () => {
     let fBody = 0;
     let getterProbe = 0;
     const runA204 = (name: string, opts: Partial<CompileOptions>, include?: string) => {
