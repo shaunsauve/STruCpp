@@ -20,7 +20,7 @@ are written. IEC identifiers are case-insensitive, so a reader compares them tha
 |---|---|
 | `format` | Always `"strucpp-debug-info"`. |
 | `major` | `1`. A reader refuses any major it does not support and names both versions. Removing or re-meaning a field is a major bump. |
-| `minor` | Additive changes only. Every object may carry properties the schema does not list; readers ignore what they do not know. |
+| `minor` | `1`: adds `pous[].frameLeaves`, `instances.parent` and the probe-build instance table; `localsSlot` is set. Additive changes only. Every object may carry properties the schema does not list; readers ignore what they do not know. |
 
 `debug-map.json`'s own `version: 2` is a separate axis and does not move with this format.
 
@@ -51,7 +51,7 @@ Three artefacts of one build carry the same `buildId`:
 | Where | What |
 |---|---|
 | `debug-info.json` | `build.buildId` (below). |
-| `debug-map.json` | One additive top-level key, `"debugInfo": {"file": "debug-info.json", "major": 1, "minor": 0, "buildId": "<hex>"}`. `version` stays `2`; the editor's loader ignores the key. |
+| `debug-map.json` | One additive top-level key, `"debugInfo": {"file": "debug-info.json", "major": 1, "minor": 1, "buildId": "<hex>"}`. `version` stays `2`; the editor's loader ignores the key. |
 | `generated_debug.cpp` | `extern "C" const char strucpp_dbg_build_id[]`, the 64-character hex id, NUL-terminated. Emitted in every build, probes on or off; the runtime resolves it by name. |
 
 `readDebugInfo(text, {md5, buildId})` refuses debug info of another build with `STALE_BUILD`,
@@ -105,6 +105,7 @@ a body of its own and is listed as a `method` of its function block named `<prop
 | `generated` | `true` when a `{strucpp generated}` pragma before the POU marks it as generated code. |
 | `typeId` | For a program or function block, the `types[].id` describing its instance members; `null` for a function or method. |
 | `locals` | Stack-resident variables (see below). |
+| `frameLeaves` | The frame's locals table (see [Frames](#frames)), or `null` when the body has no frame: probe-off, a library POU, or an empty body. |
 
 ### `locals`
 
@@ -116,14 +117,66 @@ method, and the `VAR_TEMP` variables of a program or function block.
 | `name` | Variable name. |
 | `typeId` | `types[].id` of its type. |
 | `kind` | The var block it is declared in (`VAR`, `VAR_INPUT`, `VAR_OUTPUT`, `VAR_IN_OUT`, `VAR_TEMP`, `VAR_INST`). |
-| `localsSlot` | Index into the POU's `__dbg_locals` offset table in `generated_debug.cpp`. `null` until probe builds emit that table. |
+| `localsSlot` | Slot of the variable's first leaf in the frame's locals table (`frameLeaves`). `null` probe-off, and for a variable with no readable leaf (a reference, a `STRING(n)` with `n ≠ 254`, an `ArrayView` `VAR_IN_OUT`). |
+
+### `frameLeaves`
+
+Columnar, index = slot. One entry per elementary leaf of the POU's `locals`, in `locals` order,
+each variable expanded as the debug-map leaf walk expands static storage (struct fields in
+declaration order, array elements in index order, a library FB's interface).
+
+| Field | Meaning |
+|---|---|
+| `path` | Leaf path inside the frame: `X`, `P.A`, `ARR[1]`. |
+| `type` | Type tag name, as `debug-map.json` leaves' `type`; its number is `typeTags[type]`. |
+| `size` | Bytes `strucpp_debug_read_at` writes for it. |
+
+## Frames
+
+A probe build links a frame record (`strucpp_dbg_frame`, `debug_probe.hpp`) on every entry of a
+probed clone while a session is attached (ADR-001 D3). Two fields carry what a stack walk needs:
+
+- **`pou`** is the body's `entryProbe`: the POU is the `pous[]` entry with that `entryProbe`.
+- **`locals`** is `void* const[]`, `frameLeaves.path.length` long: slot `i` is the address of
+  leaf `i`, in the live activation (a `VAR_IN_OUT` slot is the referent's address). Read one
+  with `strucpp_debug_read_at(locals[i], typeTags[frameLeaves.type[i]], dest)`
+  (`debug_dispatch.hpp`, exported with the other `strucpp_debug_*` shims), only while the task
+  is parked on that stack. `nullptr` when the POU has no frame leaf.
+- **`self`** is the program or FB instance (`this`), or null for a function. It is resolved
+  through the instance table, below.
+
+The table is built in the probed clone only, so it costs nothing while no session is attached.
+A program's or FB's `VAR_TEMP` is a member of the instance in the generated C++; its slots point
+there.
+
+### Instance table (`generated_debug.cpp`, probe builds only)
+
+```c
+extern "C" const void* const strucpp_dbg_instances[];  /* index = instances[] index */
+extern "C" uint32_t strucpp_dbg_instance_count(void);  /* = instances.path.length */
+```
+
+Entry `i` is the address of `instances.path[i]`, or null for an instance the leaf walk could not
+address (the build warns, naming it). A frame maps to its instance with no guessing:
+
+1. take the instances whose address equals `self` exactly;
+2. keep those whose type is the frame POU's type (for a method or accessor, its owner FB) or
+   `extends` it;
+3. if more than one remains, take the highest index (the innermost; this needs an FB whose base
+   is empty, so it does not arise in practice).
+
+No match means `self` is not a static instance: an FB instance declared in a function's or
+method's `VAR`, or reached through a reference. The frame then has no instance path; its
+locals still read. A host sorts the table by address once per program load. This replaces the
+runtime's interim mapping through debug-map leaf addresses (`debug_agent_leaf_of`), which could
+only find the nearest leaf at or above `self`.
 
 ## Scopes: where each variable is described
 
 | Scope | Described in |
 |---|---|
-| Program and FB `VAR`, `VAR_INPUT`, `VAR_OUTPUT`, `VAR_IN_OUT` | `members` of the POU's type, with `section` |
-| `VAR_TEMP`, and every function and method variable | `locals` of the POU |
+| Program and FB `VAR`, `VAR_INPUT`, `VAR_OUTPUT`, `VAR_IN_OUT` | `members` of the POU's type, with `section`; values through the instance's `leafBase` |
+| `VAR_TEMP`, and every function and method variable | `locals` of the POU; values through the frame (`localsSlot`) |
 | `VAR_EXTERNAL` | `externals`, resolved to `globals` |
 | `VAR_GLOBAL` | `globals` |
 
@@ -241,6 +294,7 @@ members refer to an instance owned elsewhere and are not walked.
 |---|---|
 | `path` | Instance path, as in `debug-map.json` leaf paths: `PROG0`, `PROG0.MOTOR1.PID`, `PROG0.AXES[2]`. Global FB instances use the bare global name. |
 | `typeId` | `types[].id` of the instance's type. |
+| `parent` | Index of the nearest enclosing program or FB instance (through struct fields and array elements), or `null` for a program or global instance. With the instance table, `strucpp_dbg_instances[i] - strucpp_dbg_instances[parent[i]]` is the instance's byte offset in its parent. |
 | `leafBase` | Index in `debug-map.json` `leaves` of the instance's first leaf, or `null` if it has none. A member's leaf is `leafBase` plus its ordinal in the type's leaf order. |
 | `leafBaseExt` | First leaf of the instance's sections that `debug-map.json` does not yet cover, appended after every existing leaf (the second leaf pass). `null` until that pass exists. |
 
@@ -287,3 +341,12 @@ the same file, else `-1`. ST debugging ignores them. Empty when no map is given.
 
 Per-variable display formatters from declaration attributes, referenced by `members[].format`.
 Empty today.
+
+## Deriving ADR-006's state table
+
+The state table (ADR-006 D2.2) is the same instance walk with the leaf walk in a state mode:
+`instances` gives every storage-owning instance with its `parent`, `strucpp_dbg_instances` its
+address, and the leaf walk (`createLeafWalker`, `src/backend/debug-table-gen.ts`) the members.
+What the state mode adds is not emitted yet: library FB locals for every instance (the walk
+takes them only for a RETAIN instance today), hidden codegen members, vptr records, and the
+per-class `offsetof`/`sizeof` replay with its `static_assert`s.

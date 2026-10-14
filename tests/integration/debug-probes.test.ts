@@ -458,6 +458,37 @@ const insnText = (dis: string): string[] =>
     .filter((l) => /^\s*[0-9a-f]+:\s+\S/.test(l) && !/^\s*[0-9a-f]+:\s+(R_|ARM64_RELOC_|X86_64_RELOC_)/.test(l))
     .map((l) => l.trim().replace(/\s+/g, " "));
 
+/**
+ * insnText with the machine outliner's helpers (`_OUTLINED_FUNCTION_<n>`,
+ * Apple clang) set apart: -g may number and order them differently while
+ * outlining the same sequences, which moves no poll and no line. They are
+ * compared as a sorted set of bodies, without addresses; everything else
+ * instruction by instruction.
+ */
+function insnTextOutlined(dis: string): { code: string[]; outlined: string[] } {
+  const code: string[] = [];
+  const outlined: string[] = [];
+  let body: string[] | undefined;
+  const flush = (): void => {
+    if (body) outlined.push(body.join("; "));
+    body = undefined;
+  };
+  for (const raw of dis.split("\n")) {
+    const head = /^[0-9a-f]+ <(.+)>:$/.exec(raw.trim());
+    if (head) {
+      flush();
+      if (/^_?_OUTLINED_FUNCTION_\d+$/.test(head[1]!)) body = [];
+      continue;
+    }
+    const [line] = insnText(raw);
+    if (line === undefined) continue;
+    if (body) body.push(line.replace(/^[0-9a-f]+: /, "").replace(/ 0x[0-9a-f]+ <.*>$/, ""));
+    else code.push(line);
+  }
+  flush();
+  return { code, outlined: outlined.sort() };
+}
+
 /** Probed clones, leaf entries, transfer stubs and the frame record run only with a session attached. */
 const SESSION_ONLY = /__dbg_(probed|entry|xfer)|dbg5Frame|clang_call_terminate/;
 const ACTIVE = "strucpp_dbg_active";
@@ -620,10 +651,14 @@ function auditPolls(
       failures.push(`${f.name}: no object`);
       continue;
     }
-    const g = insnText(d.g);
-    const p = insnText(d.plain);
+    const go = insnTextOutlined(d.g);
+    const po = insnTextOutlined(d.plain);
+    const g = go.code;
+    const p = po.code;
     const diff = g.findIndex((l, i) => l !== p[i]);
-    if (diff >= 0 || g.length !== p.length) {
+    if (go.outlined.join("\n") !== po.outlined.join("\n")) {
+      failures.push(`${f.name}: -g changed the outlined helpers`);
+    } else if (diff >= 0 || g.length !== p.length) {
       failures.push(`${f.name}: -g changed the code at instruction ${diff}: ${g[diff]} vs ${p[diff]}`);
     }
     const a = activeLoads(arch, parseDis(d.g));
@@ -1724,5 +1759,154 @@ END_FUNCTION_BLOCK`);
       expect(f.out).toMatch(/B_BLOCKED/);
       expect(f.status).toBe(3);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A088 (compiler side): a halted stack maps to instances and readable locals.
+// ---------------------------------------------------------------------------
+
+const STACK = `
+TYPE Pair : STRUCT a : INT; b : DINT; END_STRUCT; END_TYPE
+
+FUNCTION Mix : DINT
+  VAR_INPUT x : DINT; END_VAR
+  VAR_IN_OUT acc : DINT; END_VAR
+  VAR p : Pair; arr : ARRAY[0..2] OF INT; k : DINT; END_VAR
+  p.a := 7; p.b := x * 10; arr[1] := 5; k := 3;
+  acc := acc + x;                                           (*@STOP*)
+  Mix := k;
+END_FUNCTION
+
+FUNCTION_BLOCK Inner
+  VAR_INPUT v : DINT; END_VAR
+  VAR_OUTPUT o : DINT; END_VAR
+  VAR total : DINT := 100; END_VAR
+  VAR_TEMP t : DINT; END_VAR
+  t := v + 1;
+  o := Mix(t, total);
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK Outer
+  VAR inner : Inner; spare : Inner; END_VAR
+  inner(v := 41);
+END_FUNCTION_BLOCK
+
+PROGRAM Main
+  VAR o1 : Outer; o2 : Outer; END_VAR
+  o2();
+END_PROGRAM
+
+CONFIGURATION Config0
+  RESOURCE Res0 ON PLC
+    TASK t0(INTERVAL := T#10ms, PRIORITY := 1);
+    PROGRAM instance0 WITH t0 : Main;
+  END_RESOURCE
+END_CONFIGURATION
+`;
+
+describe.skipIf(!hasGpp || !PROBES_ON)(`A088 compiler side: frames map to instances and their locals read through the frame (${PROBE_CONFIG})`, () => {
+  it("halted in a function called from a nested FB: each frame's instance and every local leaf equal the oracle", () => {
+    const r = build(STACK, { md5: "x" });
+    const info = r.debugInfo!;
+    const stop = probeAt(STACK, r, "STOP");
+    const tags = r.debugMap!.typeTags;
+    // Per POU (by entry probe): the tag of each frame leaf, in slot order.
+    const slotTags = info.pous
+      .filter((p) => p.entryProbe !== null)
+      .map((p) => `{${p.entryProbe}u, {${(p.frameLeaves?.type ?? []).map((t) => tags[t]).join(", ")}}}`);
+    const main = `
+#include "generated.hpp"
+#include "debug_probe_stub.hpp"
+#include "debug_dispatch.hpp"
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <vector>
+strucpp::Configuration_CONFIG0 g_config;
+extern "C" const void* const strucpp_dbg_instances[];
+extern "C" uint32_t strucpp_dbg_instance_count(void);
+using namespace strucpp;
+static const std::map<uint32_t, std::vector<int>> kSlotTags = {${slotTags.join(", ")}};
+static void on_stop(uint32_t, const strucpp_dbg_frame* f) {
+  for (; f; f = f->prev) {
+    long inst = -1;
+    for (uint32_t i = 0; i < strucpp_dbg_instance_count(); ++i)
+      if (f->self && strucpp_dbg_instances[i] == f->self) inst = (long)i;
+    std::printf("F %u %ld", f->pou, inst);
+    void* const* slots = static_cast<void* const*>(f->locals);
+    for (int tag : kSlotTags.at(f->pou)) {
+      uint8_t b[8] = {0};
+      debug::read_at(*slots++, (uint8_t)tag, b);
+      long long v = 0;
+      std::memcpy(&v, b, 8);
+      if (tag == debug::TAG_INT) v = (int16_t)v; else if (tag == debug::TAG_DINT) v = (int32_t)v;
+      std::printf(" %lld", v);
+    }
+    std::printf("\\n");
+  }
+}
+int main() {
+  dbg::stub::set_on_stop(on_stop);
+  dbg::stub::attach();
+  dbg::stub::arm(${stop}u);
+  g_config.INSTANCE0.run();
+  uint32_t live = 0;
+  for (uint32_t i = 0; i < strucpp_dbg_instance_count(); ++i) live += strucpp_dbg_instances[i] != nullptr;
+  std::printf("instances %u %u\\n", strucpp_dbg_instance_count(), live);
+  return 0;
+}
+`;
+    const res = buildAndRun("a088-stack", r, main, {
+      extraCpp: { "generated_debug.cpp": r.debugTableCpp! },
+    });
+    expect(res.status, res.out).toBe(0);
+
+    // The oracle: POUs from the debug info, values from the source.
+    const pou = (name: string) => info.pous.find((p) => p.name.toUpperCase() === name)!;
+    const inst = (path: string) => info.instances.path.indexOf(path);
+    const frame = (name: string, path: string | null, values: Record<string, number>) => {
+      const p = pou(name);
+      const leaves = p.frameLeaves?.path ?? [];
+      expect(leaves.slice().sort(), `${name} frame leaves`).toEqual(Object.keys(values).sort());
+      return `F ${p.entryProbe} ${path === null ? -1 : inst(path)}${leaves.map((l) => ` ${values[l]}`).join("")}`;
+    };
+    const n = info.instances.path.length;
+    expect(res.out.trim().split("\n")).toEqual([
+      frame("MIX", null, {
+        X: 42, ACC: 100, "P.A": 7, "P.B": 420, "ARR[0]": 0, "ARR[1]": 5, "ARR[2]": 0, K: 3,
+      }),
+      frame("INNER", "INSTANCE0.O2.INNER", { T: 42 }),
+      frame("OUTER", "INSTANCE0.O2", {}),
+      frame("MAIN", "INSTANCE0", {}),
+      `instances ${n} ${n}`,
+    ]);
+    // Instance table: every program and FB instance, with its enclosing instance.
+    expect(info.instances.path).toEqual([
+      "INSTANCE0", "INSTANCE0.O1", "INSTANCE0.O1.INNER", "INSTANCE0.O1.SPARE",
+      "INSTANCE0.O2", "INSTANCE0.O2.INNER", "INSTANCE0.O2.SPARE",
+    ]);
+    expect(info.instances.parent).toEqual([null, 0, 1, 1, 0, 4, 4]);
+    // Each local names the first of its leaves.
+    const mix = pou("MIX");
+    expect(Object.fromEntries(mix.locals.map((l) => [l.name.toUpperCase(), l.localsSlot]))).toEqual({
+      X: mix.frameLeaves!.path.indexOf("X"),
+      ACC: mix.frameLeaves!.path.indexOf("ACC"),
+      P: mix.frameLeaves!.path.indexOf("P.A"),
+      ARR: mix.frameLeaves!.path.indexOf("ARR[0]"),
+      K: mix.frameLeaves!.path.indexOf("K"),
+    });
+  });
+});
+
+describe("A088 compiler side, probe-off", () => {
+  it("probe-off: no instance or frame tables, and locals carry no slot", () => {
+    const off = build(STACK, { debugProbes: false, md5: "x" });
+    expect(off.debugTableCpp).not.toMatch(/strucpp_dbg_instances/);
+    expect(off.debugInfo!.instances.parent).toEqual([null, 0, 1, 1, 0, 4, 4]);
+    for (const p of off.debugInfo!.pous) {
+      expect(p.frameLeaves, p.name).toBeNull();
+      for (const l of p.locals) expect(l.localsSlot, `${p.name}.${l.name}`).toBeNull();
+    }
   });
 });

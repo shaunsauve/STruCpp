@@ -27,6 +27,7 @@ import { CodeGenerator } from "./backend/codegen.js";
 import { planProbes } from "./backend/probe-plan.js";
 import {
   generateDebugTable,
+  renderInstanceTable,
   type DebugMapV2,
 } from "./backend/debug-table-gen.js";
 import {
@@ -1014,8 +1015,8 @@ export function compile(
       pipeline.symbolTables,
       { md5, buildId: identity.buildId },
     );
-    debugTableCpp = dbg.debugTableCpp;
     debugMap = dbg.debugMap;
+    const codegenProbes = identity.options.debugProbes === true;
     debugInfo = generateDebugInfo({
       ast: pipeline.ast,
       projectModel: pipeline.projectModel,
@@ -1026,11 +1027,30 @@ export function compile(
       md5,
       identity,
       linkedLibraryPous: linkedPous.filter((p) => p.library !== null),
+      ...(codegenProbes ? { frames: codeResult.frames } : {}),
       ...(opts.sourceOrigins ? { sourceOrigins: opts.sourceOrigins } : {}),
       ...(opts.globalConstants
         ? { globalConstants: opts.globalConstants }
         : {}),
     });
+    // The instance table exists only with probes: a probe-off build has no
+    // frames to map (ADR-002 D1).
+    debugTableCpp = dbg.debugTableCpp;
+    if (codegenProbes) {
+      const table = renderInstanceTable(
+        debugInfo.instances.path,
+        dbg.instanceExprs,
+      );
+      debugTableCpp += table.cpp;
+      for (const path of table.missing) {
+        pipeline.warnings.push({
+          message: `instance ${path} has no address in the instance table: the debugger cannot map a frame to it.`,
+          line: 0,
+          column: 0,
+          severity: "warning",
+        });
+      }
+    }
 
     // A RETAIN the walk could not follow all the way down is a WARNING, not an
     // error. The program still builds and its visible surface is still

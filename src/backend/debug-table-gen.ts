@@ -345,6 +345,8 @@ export interface DebugTableResult {
   skipped: Array<{ path: string; reason: string }>;
   /** Retained state the walk could not reach; surfaced as compile warnings. */
   incomplete: Array<{ path: string; reason: string }>;
+  /** C++ lvalue of each program and function-block instance the walk reached, by path. */
+  instanceExprs: Map<string, string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -384,16 +386,50 @@ interface Entry {
   flags: number;
 }
 
-export function generateDebugTable(
-  ast: CompilationUnit,
-  projectModel: ProjectModel,
-  symbolTables: SymbolTables,
-  opts: DebugTableGenOptions = {},
-): DebugTableResult {
-  const maxEntries = opts.maxEntriesPerArray ?? DEFAULTS.maxEntriesPerArray;
-  const configGlobal = opts.configGlobalName ?? DEFAULTS.configGlobalName;
-  const md5 = opts.md5 ?? "";
+/** Where a leaf walk reports what it finds. */
+export interface LeafSink {
+  /** An elementary leaf; `iecName` is its IEC type name. */
+  leaf(path: string, cppExpr: string, iecName: string, flags: number): void;
+  /** A variable left out, with the reason. */
+  skip(item: { path: string; reason: string }): void;
+  /** Retained state the walk could not reach. */
+  incomplete(item: { path: string; reason: string }): void;
+  /** A function-block instance, before its members. */
+  instance?(path: string, cppExpr: string): void;
+}
 
+export interface LeafWalker {
+  visitTypeRef: (
+    path: string,
+    cppExpr: string,
+    typeRef: TypeReference,
+    flags: number,
+  ) => void;
+  visitVarDecl: (
+    path: string,
+    cppExpr: string,
+    decl: VarDeclaration,
+    flags: number,
+    ownerTypeName?: string,
+  ) => void;
+  /** C++ member name codegen declared a member under. */
+  memberCppName: (
+    varName: string,
+    typeRef: TypeReference | undefined,
+    ownerTypeName?: string,
+  ) => string;
+}
+
+/**
+ * The leaf walk of the debug table, rooted wherever the caller says: the
+ * static instances here, a POU's frame locals in codegen (`__dbg_locals`).
+ * One walk, so a frame's leaves are laid out exactly as static ones are.
+ */
+export function createLeafWalker(
+  ast: CompilationUnit,
+  symbolTables: SymbolTables,
+  sink: LeafSink,
+): LeafWalker {
   // Programs only live in the user AST (libraries don't ship PROGRAM blocks),
   // so we index them locally. Types and function blocks come from the symbol
   // table — that's the unified source covering both user-defined declarations
@@ -454,67 +490,6 @@ export function generateDebugTable(
     }
   }
 
-  // Buckets of entries — grown in order, flushed at program boundary or size cap.
-  const arrays: Entry[][] = [[]];
-  const leaves: DebugLeaf[] = [];
-  /** Retained leaves in walk order — the order the blob packs them. */
-  const retainVars: Array<{
-    arrayIdx: number;
-    elemIdx: number;
-    path: string;
-    size: number;
-    tagName: TagName;
-  }> = [];
-  const skipped: Array<{ path: string; reason: string }> = [];
-  /**
-   * Retained state the walk could not reach — today only a RETAIN on a library
-   * block whose manifest predates exported locals.
-   *
-   * Kept apart from `skipped`, which is a normal list nobody reads on a good
-   * build. These are surfaced as compile WARNINGS: the program still builds
-   * and its visible surface is still retained, because refusing would strand
-   * anyone using a third-party .stlib they cannot rebuild. But a partial
-   * retain that nobody is told about is exactly the failure this reports.
-   */
-  const incomplete: Array<{ path: string; reason: string }> = [];
-
-  const tail = (): Entry[] => arrays[arrays.length - 1]!;
-
-  const ensureRoom = () => {
-    if (tail().length >= maxEntries) arrays.push([]);
-  };
-
-  const addLeaf = (
-    path: string,
-    cppExpr: string,
-    iecName: string,
-    flags: number,
-  ) => {
-    const tagName = IEC_NAME_TO_TAG[iecName.toUpperCase()];
-    if (tagName === undefined) {
-      skipped.push({ path, reason: `unknown elementary type: ${iecName}` });
-      return;
-    }
-    const size = IEC_NAME_TO_SIZE[iecName.toUpperCase()] ?? 0;
-    ensureRoom();
-    const bucket = tail();
-    const arrIdx = arrays.length - 1;
-    const elemIdx = bucket.length;
-    bucket.push({ cppExpr, tagName, path, type: tagName, size, flags });
-    leaves.push({
-      arrayIdx: arrIdx,
-      elemIdx,
-      path,
-      type: tagName,
-      size,
-      ...(flags & LEAF_FLAG_READONLY ? { readOnly: true as const } : {}),
-      ...(flags & LEAF_FLAG_RETAIN ? { retain: true as const } : {}),
-    });
-    if (flags & LEAF_FLAG_RETAIN) {
-      retainVars.push({ arrayIdx: arrIdx, elemIdx, path, size, tagName });
-    }
-  };
-
   // The reference kind a TYPE alias resolves to (`TYPE PI : POINTER TO INT`), if any.
   const aliasReferenceKind = (typeName: string): string | undefined => {
     let name = typeName;
@@ -544,7 +519,7 @@ export function generateDebugTable(
       typeRef.referenceKind !== undefined &&
       typeRef.referenceKind !== "none"
     ) {
-      skipped.push({
+      sink.skip({
         path,
         reason:
           `${REFERENCE_KIND_TEXT[typeRef.referenceKind] ?? "reference"} holds an ` +
@@ -559,7 +534,7 @@ export function generateDebugTable(
         typeRef.elementReferenceChain?.[0] ??
         aliasReferenceKind(typeRef.elementTypeName);
       if (elementKind !== undefined) {
-        skipped.push({ path, reason: arrayOfReferencesReason(elementKind) });
+        sink.skip({ path, reason: arrayOfReferencesReason(elementKind) });
         return;
       }
       walkArrayDims(
@@ -604,7 +579,7 @@ export function generateDebugTable(
         typeRef.maxLength !== undefined &&
         typeRef.maxLength !== DISPATCH_STRING_CAPACITY
       ) {
-        skipped.push({
+        sink.skip({
           path,
           reason:
             `declared ${name}(${typeRef.maxLength}), but the debug dispatch ` +
@@ -613,7 +588,7 @@ export function generateDebugTable(
         });
         return;
       }
-      addLeaf(path, cppExpr, name, flags);
+      sink.leaf(path, cppExpr, name, flags);
       return;
     }
 
@@ -633,7 +608,7 @@ export function generateDebugTable(
             ? ownKind
             : aliasReferenceKind(def.elementType.name);
         if (elementKind !== undefined) {
-          skipped.push({ path, reason: arrayOfReferencesReason(elementKind) });
+          sink.skip({ path, reason: arrayOfReferencesReason(elementKind) });
           return;
         }
         // TYPE MyArr: ARRAY[0..9] OF INT; END_TYPE
@@ -644,7 +619,7 @@ export function generateDebugTable(
             end: evalIntConst(d.end),
           }));
         if (dims.some((d) => d.start === undefined || d.end === undefined)) {
-          skipped.push({ path, reason: `array bounds not constant` });
+          sink.skip({ path, reason: `array bounds not constant` });
           return;
         }
         walkArrayDims(
@@ -662,19 +637,19 @@ export function generateDebugTable(
         // matches the base. Default INT if no baseType.
         const baseName = def.baseType?.name?.toUpperCase() ?? "INT";
         if (IEC_NAME_TO_TAG[baseName] !== undefined) {
-          addLeaf(path, cppExpr, baseName, flags);
+          sink.leaf(path, cppExpr, baseName, flags);
           return;
         }
-        skipped.push({ path, reason: `enum base type ${baseName} unknown` });
+        sink.skip({ path, reason: `enum base type ${baseName} unknown` });
         return;
       }
       if (def.kind === "SubrangeDefinition") {
         const baseName = def.baseType.name.toUpperCase();
         if (IEC_NAME_TO_TAG[baseName] !== undefined) {
-          addLeaf(path, cppExpr, baseName, flags);
+          sink.leaf(path, cppExpr, baseName, flags);
           return;
         }
-        skipped.push({ path, reason: `subrange base ${baseName} unknown` });
+        sink.skip({ path, reason: `subrange base ${baseName} unknown` });
         return;
       }
       // TypeReference alias. The library loader registers library types
@@ -686,7 +661,7 @@ export function generateDebugTable(
       // into them, just like it doesn't recurse into library FB locals.
       if (def.kind === "TypeReference") {
         if (def.name.toUpperCase() === name) {
-          skipped.push({
+          sink.skip({
             path,
             reason: `library type ${typeRef.name} is opaque to the debugger`,
           });
@@ -695,7 +670,7 @@ export function generateDebugTable(
         visitTypeRef(path, cppExpr, def, flags);
         return;
       }
-      skipped.push({
+      sink.skip({
         path,
         reason: `unsupported TYPE kind: ${(def as { kind: string }).kind}`,
       });
@@ -723,6 +698,7 @@ export function generateDebugTable(
     //     those are not persistent state.
     const fbSym = symbolTables.lookupFunctionBlock(name);
     if (fbSym) {
+      sink.instance?.(path, cppExpr);
       const interfaceVars = [
         ...fbSym.inputs,
         ...fbSym.outputs,
@@ -764,7 +740,7 @@ export function generateDebugTable(
             // anyone using a third-party .stlib they cannot rebuild — but it
             // is a partial retain, so it is said out loud rather than left to
             // be discovered after a power cycle.
-            incomplete.push({
+            sink.incomplete({
               path,
               reason:
                 `RETAIN on ${typeRef.name}: this library does not export the ` +
@@ -811,7 +787,7 @@ export function generateDebugTable(
       return;
     }
 
-    skipped.push({ path, reason: `unresolved type name: ${typeRef.name}` });
+    sink.skip({ path, reason: `unresolved type name: ${typeRef.name}` });
   };
 
   const visitStructFields = (
@@ -956,6 +932,94 @@ export function generateDebugTable(
     }
   };
 
+  return { visitTypeRef, visitVarDecl, memberCppName };
+}
+
+export function generateDebugTable(
+  ast: CompilationUnit,
+  projectModel: ProjectModel,
+  symbolTables: SymbolTables,
+  opts: DebugTableGenOptions = {},
+): DebugTableResult {
+  const maxEntries = opts.maxEntriesPerArray ?? DEFAULTS.maxEntriesPerArray;
+  const configGlobal = opts.configGlobalName ?? DEFAULTS.configGlobalName;
+  const md5 = opts.md5 ?? "";
+
+  const programByName = new Map<string, ProgramDeclaration>();
+  for (const p of ast.programs) programByName.set(p.name.toUpperCase(), p);
+
+  // Buckets of entries — grown in order, flushed at program boundary or size cap.
+  const arrays: Entry[][] = [[]];
+  const leaves: DebugLeaf[] = [];
+  /** Retained leaves in walk order — the order the blob packs them. */
+  const retainVars: Array<{
+    arrayIdx: number;
+    elemIdx: number;
+    path: string;
+    size: number;
+    tagName: TagName;
+  }> = [];
+  const skipped: Array<{ path: string; reason: string }> = [];
+  /**
+   * Retained state the walk could not reach — today only a RETAIN on a library
+   * block whose manifest predates exported locals.
+   *
+   * Kept apart from `skipped`, which is a normal list nobody reads on a good
+   * build. These are surfaced as compile WARNINGS: the program still builds
+   * and its visible surface is still retained, because refusing would strand
+   * anyone using a third-party .stlib they cannot rebuild. But a partial
+   * retain that nobody is told about is exactly the failure this reports.
+   */
+  const incomplete: Array<{ path: string; reason: string }> = [];
+
+  const tail = (): Entry[] => arrays[arrays.length - 1]!;
+
+  const ensureRoom = () => {
+    if (tail().length >= maxEntries) arrays.push([]);
+  };
+
+  const addLeaf = (
+    path: string,
+    cppExpr: string,
+    iecName: string,
+    flags: number,
+  ) => {
+    const tagName = IEC_NAME_TO_TAG[iecName.toUpperCase()];
+    if (tagName === undefined) {
+      skipped.push({ path, reason: `unknown elementary type: ${iecName}` });
+      return;
+    }
+    const size = IEC_NAME_TO_SIZE[iecName.toUpperCase()] ?? 0;
+    ensureRoom();
+    const bucket = tail();
+    const arrIdx = arrays.length - 1;
+    const elemIdx = bucket.length;
+    bucket.push({ cppExpr, tagName, path, type: tagName, size, flags });
+    leaves.push({
+      arrayIdx: arrIdx,
+      elemIdx,
+      path,
+      type: tagName,
+      size,
+      ...(flags & LEAF_FLAG_READONLY ? { readOnly: true as const } : {}),
+      ...(flags & LEAF_FLAG_RETAIN ? { retain: true as const } : {}),
+    });
+    if (flags & LEAF_FLAG_RETAIN) {
+      retainVars.push({ arrayIdx: arrIdx, elemIdx, path, size, tagName });
+    }
+  };
+
+  /** C++ expression of every function-block instance the walk reached, by path. */
+  const instanceExprs = new Map<string, string>();
+  const { visitTypeRef, visitVarDecl } = createLeafWalker(ast, symbolTables, {
+    leaf: addLeaf,
+    skip: (item) => skipped.push(item),
+    incomplete: (item) => incomplete.push(item),
+    instance: (path, cppExpr) => {
+      if (!instanceExprs.has(path)) instanceExprs.set(path, cppExpr);
+    },
+  });
+
   // Configurations carry both VAR_GLOBAL declarations and the
   // resource → task → program-instance tree. Globals go first so they own
   // a dedicated bucket at the head of the table — that way edits to a
@@ -1005,6 +1069,8 @@ export function generateDebugTable(
           const instName = instance.instanceName.toUpperCase();
           const basePath = instName;
           const baseCpp = `${configGlobal}.${instance.instanceName}`;
+          if (!instanceExprs.has(basePath))
+            instanceExprs.set(basePath, baseCpp);
 
           for (const block of prog.varBlocks) {
             // Exclude VAR_EXTERNAL (points to globals handled separately) and
@@ -1081,7 +1147,7 @@ export function generateDebugTable(
       : {}),
   };
 
-  return { debugTableCpp, debugMap, skipped, incomplete };
+  return { debugTableCpp, debugMap, skipped, incomplete, instanceExprs };
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1272,33 @@ function renderCpp(
     lines.push(`extern "C" const char strucpp_dbg_build_id[] = "${buildId}";`);
   }
   return lines.join("\n") + "\n";
+}
+
+/**
+ * The instance pointer table of a probe build, appended to generated_debug.cpp:
+ * `strucpp_dbg_instances[i]` is the address of debug-info `instances.path[i]`,
+ * so a frame's `self` maps to its instance by address (ADR-002 D3). An instance
+ * the leaf walk did not reach is `nullptr`, counted in `missing`.
+ */
+export function renderInstanceTable(
+  paths: string[],
+  instanceExprs: Map<string, string>,
+): { cpp: string; missing: string[] } {
+  const missing: string[] = [];
+  const rows = paths.map((path) => {
+    const expr = instanceExprs.get(path);
+    if (expr === undefined) missing.push(path);
+    return `    ${expr === undefined ? "nullptr" : `(const void*)&${expr}`},  // ${path}`;
+  });
+  const lines = [
+    "",
+    "// Instance table: index = debug-info.json `instances` index.",
+    `extern "C" const void* const strucpp_dbg_instances[${Math.max(paths.length, 1)}] = {`,
+    ...(rows.length > 0 ? rows : ["    nullptr,  // placeholder: no instance"]),
+    "};",
+    `extern "C" uint32_t strucpp_dbg_instance_count(void) { return ${paths.length}; }`,
+  ];
+  return { cpp: lines.join("\n") + "\n", missing };
 }
 
 // ---------------------------------------------------------------------------

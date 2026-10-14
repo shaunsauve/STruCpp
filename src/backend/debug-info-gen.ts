@@ -29,10 +29,43 @@ import { spanContains } from "../frontend/generated-pragmas.js";
 import type { ProbePlan } from "./probe-plan.js";
 
 export const DEBUG_INFO_FORMAT = "strucpp-debug-info";
+
+/**
+ * The variables a POU's frame describes (`pous[].locals`), in order. Codegen
+ * builds the frame's `__dbg_locals` table from the same list, so `localsSlot`
+ * and the table cannot disagree.
+ */
+export function frameVarDecls(
+  blocks: VarBlock[],
+  kind: "program" | "fb" | "function" | "method",
+): Array<{ block: VarBlock; decl: VarDeclaration; name: string }> {
+  const keep =
+    kind === "program" || kind === "fb"
+      ? (b: VarBlock): boolean => b.blockType === "VAR_TEMP"
+      : (b: VarBlock): boolean =>
+          b.blockType !== "VAR_EXTERNAL" && b.blockType !== "VAR_GLOBAL";
+  return blocks
+    .filter(keep)
+    .flatMap((block) =>
+      block.declarations.flatMap((decl) =>
+        decl.names.map((name) => ({ block, decl, name })),
+      ),
+    );
+}
+
+/**
+ * One POU body's frame table: the leaves of its frame variables, in slot
+ * order (`frame->locals[slot]` is the address of leaf `slot`), and the first
+ * slot of each variable of frameVarDecls (null when it has no leaf).
+ */
+export interface FrameTable {
+  leaves: Array<{ path: string; type: string; size: number }>;
+  firstSlot: Array<number | null>;
+}
 /** `probes.flags` bit 0: the statement is in generated code. */
 export const PROBE_FLAG_GENERATED = 1;
 export const DEBUG_INFO_MAJOR = 1;
-export const DEBUG_INFO_MINOR = 0;
+export const DEBUG_INFO_MINOR = 1;
 
 export type DebugTypeKind =
   | "fb"
@@ -79,7 +112,8 @@ export interface DebugLocal {
   typeId: number;
   /** IEC var block: VAR, VAR_INPUT, VAR_OUTPUT, VAR_IN_OUT, VAR_TEMP, VAR_INST. */
   kind: string;
-  /** Index into the POU's `__dbg_locals` offset table; null until probe builds emit it. */
+  /** Slot of the variable's first leaf in the frame's `__dbg_locals` table
+   *  (`frameLeaves`); null probe-off or when no leaf of it is readable. */
   localsSlot: number | null;
 }
 
@@ -97,6 +131,8 @@ export interface DebugPou {
   generated: boolean;
   typeId: number | null;
   locals: DebugLocal[];
+  /** Leaves of the frame's `__dbg_locals` table, index = slot; null with no frame. */
+  frameLeaves: { path: string[]; type: string[]; size: number[] } | null;
 }
 
 export interface DebugFile {
@@ -139,6 +175,8 @@ export interface DebugInfoV1 {
   instances: {
     path: string[];
     typeId: number[];
+    /** Index of the enclosing program or FB instance; null for a root. */
+    parent: Array<number | null>;
     leafBase: Array<number | null>;
     leafBaseExt: Array<number | null>;
   };
@@ -336,6 +374,8 @@ export interface DebugInfoInput {
   linkedLibraryPous?: LinkedPou[];
   /** Transpiler source maps; their entries become `origins`, in order. */
   sourceOrigins?: SourceOriginMap[];
+  /** Codegen's frame tables of a probe build, keyed by POU body; absent probe-off. */
+  frames?: Map<object, FrameTable>;
 }
 
 /** Var blocks stored in a program or FB instance; VAR_TEMP is frame storage, VAR_EXTERNAL a global. */
@@ -717,19 +757,26 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
 
   const localsOf = (
     blocks: VarBlock[],
-    keep: (b: VarBlock) => boolean,
+    kind: DebugPou["kind"],
+    frame: FrameTable | undefined,
   ): DebugLocal[] =>
-    blocks.filter(keep).flatMap((b) =>
-      b.declarations.flatMap((decl) => {
-        const typeId = typeOf(decl.type);
-        return decl.names.map((name) => ({
-          name,
-          typeId,
-          kind: b.blockType,
-          localsSlot: null,
-        }));
-      }),
-    );
+    frameVarDecls(blocks, kind).map(({ block, decl, name }, i) => ({
+      name,
+      typeId: typeOf(decl.type),
+      kind: block.blockType,
+      localsSlot: frame?.firstSlot[i] ?? null,
+    }));
+
+  const frameLeavesOf = (
+    frame: FrameTable | undefined,
+  ): DebugPou["frameLeaves"] =>
+    frame
+      ? {
+          path: frame.leaves.map((l) => l.path),
+          type: frame.leaves.map((l) => l.type),
+          size: frame.leaves.map((l) => l.size),
+        }
+      : null;
 
   const addPou = (
     node: {
@@ -740,9 +787,9 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     kind: DebugPou["kind"],
     owner: number | null,
     typeId: number | null,
-    keepLocal: (b: VarBlock) => boolean,
     body: object = node,
   ): number => {
+    const frame = input.frames?.get(body);
     const id = pous.length;
     pouIdByBody.set(body, id);
     const span = node.sourceSpan;
@@ -766,7 +813,8 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
           spanContains(r.span, span.endLine, span.endCol),
       ),
       typeId,
-      locals: localsOf(node.varBlocks, keepLocal),
+      locals: localsOf(node.varBlocks, kind, frame),
+      frameLeaves: frameLeavesOf(frame),
     });
     for (const block of node.varBlocks) {
       if (block.blockType !== "VAR_EXTERNAL") continue;
@@ -783,23 +831,13 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     return id;
   };
 
-  const isTemp = (b: VarBlock): boolean => b.blockType === "VAR_TEMP";
-  const isFrameVar = (b: VarBlock): boolean =>
-    b.blockType !== "VAR_EXTERNAL" && b.blockType !== "VAR_GLOBAL";
-
   for (const prog of ast.programs) {
-    addPou(prog, "program", null, namedType(prog.name.toUpperCase()), isTemp);
+    addPou(prog, "program", null, namedType(prog.name.toUpperCase()));
   }
   for (const fb of ast.functionBlocks) {
-    const fbId = addPou(
-      fb,
-      "fb",
-      null,
-      namedType(fb.name.toUpperCase()),
-      isTemp,
-    );
+    const fbId = addPou(fb, "fb", null, namedType(fb.name.toUpperCase()));
     for (const method of fb.methods) {
-      addPou(method, "method", fbId, null, isFrameVar);
+      addPou(method, "method", fbId, null);
     }
     // Accessors are bodies of their own (get_P / set_P in C++); named P.GET / P.SET.
     for (const prop of fb.properties) {
@@ -822,14 +860,13 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
           "method",
           fbId,
           null,
-          isFrameVar,
           statements,
         );
       }
     }
   }
   for (const fn of ast.functions) {
-    addPou(fn, "function", null, null, isFrameVar);
+    addPou(fn, "function", null, null);
   }
 
   // --- Statement map ---------------------------------------------------------
@@ -905,6 +942,7 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
   const instances: DebugInfoV1["instances"] = {
     path: [],
     typeId: [],
+    parent: [],
     leafBase: [],
     leafBaseExt: [],
   };
@@ -923,14 +961,19 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     return result;
   };
 
-  const walkMembers = (path: string, t: DebugType): void => {
+  // `parent` is the nearest enclosing program or FB instance of the walk.
+  const walkMembers = (
+    path: string,
+    t: DebugType,
+    parent: number | null,
+  ): void => {
     if (t.extends !== undefined && t.extends !== null) {
-      walkMembers(path, types[t.extends]!);
+      walkMembers(path, types[t.extends]!, parent);
     }
     for (const m of t.members ?? []) {
       // An IN_OUT member refers to an instance owned elsewhere.
       if (m.section === "VAR_IN_OUT" || !holds(m.typeId)) continue;
-      walkInstance(`${path}.${m.name}`, m.typeId);
+      walkInstance(`${path}.${m.name}`, m.typeId, parent);
     }
   };
 
@@ -938,29 +981,37 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     path: string,
     dims: Array<[number, number] | null>,
     elem: number,
+    parent: number | null,
   ): void => {
     const [dim, ...rest] = dims;
     if (dim === undefined) {
-      walkInstance(path, elem);
+      walkInstance(path, elem, parent);
       return;
     }
     if (dim === null) return;
     for (let i = dim[0]; i <= dim[1]; i++) {
-      walkElements(`${path}[${i}]`, rest, elem);
+      walkElements(`${path}[${i}]`, rest, elem, parent);
     }
   };
 
-  const walkInstance = (path: string, typeId: number): void => {
+  const walkInstance = (
+    path: string,
+    typeId: number,
+    parent: number | null,
+  ): void => {
     const t = types[typeId]!;
+    let self = parent;
     if (t.kind === "fb") {
+      self = instances.path.length;
       instances.path.push(path);
       instances.typeId.push(typeId);
+      instances.parent.push(parent);
       instances.leafBase.push(firstLeaf.get(path) ?? null);
       // TODO: the second leaf pass over not-yet-covered sections sets leafBaseExt.
       instances.leafBaseExt.push(null);
     }
-    if (t.kind === "array") walkElements(path, t.dims ?? [], t.elem!);
-    else walkMembers(path, t);
+    if (t.kind === "array") walkElements(path, t.dims ?? [], t.elem!, self);
+    else walkMembers(path, t, self);
   };
 
   for (const config of projectModel.configurations) {
@@ -969,13 +1020,13 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
         for (const pi of task.programInstances) {
           const name = pi.programType.toUpperCase();
           if (!programByName.has(name)) continue;
-          walkInstance(pi.instanceName.toUpperCase(), namedType(name));
+          walkInstance(pi.instanceName.toUpperCase(), namedType(name), null);
         }
       }
     }
   }
   for (const g of globals) {
-    if (holds(g.typeId)) walkInstance(g.name, g.typeId);
+    if (holds(g.typeId)) walkInstance(g.name, g.typeId, null);
   }
 
   // Library POUs are precompiled C++ with no probes: described, marked no source.
@@ -1040,6 +1091,7 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
       generated: false,
       typeId: lib.typeId,
       locals: lib.locals,
+      frameLeaves: null,
     });
   }
 

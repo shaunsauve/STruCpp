@@ -331,7 +331,7 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
       expect(a!.map!.debugInfo).toEqual({
         file: "debug-info.json",
         major: 1,
-        minor: 0,
+        minor: 1,
         buildId: infoA.build.buildId,
       });
 
@@ -396,14 +396,14 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
 
       const minor = readDebugInfo(
         variant((d) => {
-          d["minor"] = 1;
+          d["minor"] = 2;
           d["futureTable"] = [1, 2, 3];
           d.build["futureField"] = "x";
         }),
       );
       expect(minor.ok).toBe(true);
       if (minor.ok) {
-        expect(minor.info.minor).toBe(1);
+        expect(minor.info.minor).toBe(2);
         expect(minor.info.probes).toEqual(b!.info!.probes);
       }
 

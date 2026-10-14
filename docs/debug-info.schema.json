@@ -70,6 +70,20 @@
                 "localsSlot": { "$ref": "#/definitions/idOrNull" }
               }
             }
+          },
+          "frameLeaves": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": ["path", "type", "size"],
+                "properties": {
+                  "path": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                  "type": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                  "size": { "$ref": "#/definitions/countColumn" }
+                }
+              },
+              { "type": "null" }
+            ]
           }
         }
       }
@@ -163,6 +177,7 @@
       "properties": {
         "path": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "typeId": { "$ref": "#/definitions/countColumn" },
+        "parent": { "type": "array", "items": { "$ref": "#/definitions/idOrNull" } },
         "leafBase": { "type": "array", "items": { "$ref": "#/definitions/idOrNull" } },
         "leafBaseExt": { "type": "array", "items": { "$ref": "#/definitions/idOrNull" } }
       }

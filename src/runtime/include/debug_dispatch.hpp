@@ -567,6 +567,17 @@ inline uint16_t handle_read(uint8_t arr, uint16_t elem, uint8_t* dest) noexcept 
     return n;
 }
 
+/** Read the leaf at `p`, of type `tag`, into `dest`: a frame local, whose
+ *  address comes from its frame's `locals` table rather than an Entry.
+ *  Returns bytes written, or 0 for a null pointer or an unknown tag. */
+inline uint16_t read_at(const void* p, uint8_t tag, uint8_t* dest) noexcept {
+    if (!p || tag >= TAG__COUNT) return 0;
+    uint8_t n = type_ops[tag].size;
+    if (n == 0) return 0;
+    type_ops[tag].read(p, dest);
+    return n;
+}
+
 /** Soft write (non-forcing). Updates the underlying value via
  *  IECVar::set(). If the variable is currently forced, the write is
  *  silently ignored — forcing remains authoritative until unforced.
@@ -690,6 +701,13 @@ STRUCPP_V4_EXPORT uint8_t strucpp_debug_set(uint8_t arr, uint16_t elem,
 STRUCPP_V4_EXPORT uint16_t strucpp_debug_read(uint8_t arr, uint16_t elem,
                                                uint8_t *dest) {
     return strucpp::debug::handle_read(arr, elem, dest);
+}
+
+// A frame local of a parked task (debug-info.json `frameLeaves`): `p` is a
+// slot of the frame's `locals` table. Only valid while that task is parked.
+STRUCPP_V4_EXPORT uint16_t strucpp_debug_read_at(const void *p, uint8_t tag,
+                                                  uint8_t *dest) {
+    return strucpp::debug::read_at(p, tag, dest);
 }
 
 STRUCPP_V4_EXPORT uint8_t strucpp_debug_write(uint8_t arr, uint16_t elem,

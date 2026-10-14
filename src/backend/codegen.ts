@@ -11,6 +11,7 @@ import type {
   ASTNode,
   CompilationUnit,
   VarDeclaration,
+  VarBlock,
   Statement,
   Expression,
   AssignmentStatement,
@@ -71,6 +72,12 @@ import {
 } from "./codegen-utils.js";
 import { mangledMemberName, needsMemberMangling } from "./member-mangling.js";
 import { getterLockReach } from "./global-lock-reach.js";
+import {
+  createLeafWalker,
+  sizeForTypeName,
+  tagNameForTypeName,
+} from "./debug-table-gen.js";
+import { frameVarDecls, type FrameTable } from "./debug-info-gen.js";
 import {
   getTypeBits,
   getTypeCategory,
@@ -467,6 +474,9 @@ export interface CodeGenResult {
   /** One record per emitted probe, in probe order. */
   statements: StatementMapEntry[];
 
+  /** Frame table of each probed POU body, keyed as probe-plan bodies are (debug-info `frameLeaves`). */
+  frames: Map<object, FrameTable>;
+
   /** Warnings emitted during code generation */
   warnings: Array<{
     message: string;
@@ -502,6 +512,7 @@ export class CodeGenerator {
   private headerOutput: string[] = [];
   private lineMap: Map<number, LineMapEntry> = new Map();
   private statements: Map<number, StatementMapEntry> = new Map();
+  private frames: Map<object, FrameTable> = new Map();
   private headerLineMap: Map<number, LineMapEntry> = new Map();
   private currentHeaderLine = 1;
   private projectModel?: ProjectModel;
@@ -1146,6 +1157,7 @@ export class CodeGenerator {
     this.headerOutput = [];
     this.lineMap = new Map();
     this.statements = new Map();
+    this.frames = new Map();
     this.headerLineMap = new Map();
     this.currentLine = 1;
     this.currentHeaderLine = 1;
@@ -1276,6 +1288,7 @@ export class CodeGenerator {
       statements: [...this.statements.values()].sort(
         (a, b) => a.probeId - b.probeId,
       ),
+      frames: this.frames,
       warnings: this.codegenWarnings,
     };
   }
@@ -7012,8 +7025,16 @@ export class CodeGenerator {
     this.dbgLabels = [];
     this.emit("// strucpp:probed-clone begin");
     this.emit(`STRUCPP_DBG_PROBED ${body.probedHead} {`);
+    const frame = this.frameTable(body.key);
+    this.frames.set(body.key, frame.table);
+    if (frame.exprs.length > 0) {
+      // The C-style cast also drops the const of a CONSTANT local or a const accessor.
+      this.emit(
+        `${indent}void* const __dbg_locals[${frame.exprs.length}] = { ${frame.exprs.map((e) => `(void*)&${e}`).join(", ")} };`,
+      );
+    }
     this.emit(
-      `${indent}STRUCPP_FRAME(${this.entryProbe(body.key)}u, ${body.self}, nullptr);`,
+      `${indent}STRUCPP_FRAME(${this.entryProbe(body.key)}u, ${body.self}, ${frame.exprs.length > 0 ? "(void*)__dbg_locals" : "nullptr"});`,
     );
     const dispatchAt = this.output.length;
     this.emit("");
@@ -7041,6 +7062,69 @@ export class CodeGenerator {
     this.probeMode = "plain";
     this.dualBody = undefined;
     return probed;
+  }
+
+  /**
+   * The frame table of a probed body: the address of every leaf of its frame
+   * variables (debug-info `pous[].locals`), walked as the debug table walks
+   * static storage. Taking the addresses happens only in the probed clone.
+   * An accessor body (keyed by its statements) declares no variables.
+   */
+  private frameTable(key: object): {
+    table: FrameTable;
+    exprs: string[];
+  } {
+    const table: FrameTable = { leaves: [], firstSlot: [] };
+    const exprs: string[] = [];
+    const node = key as {
+      kind?: string;
+      name?: string;
+      varBlocks?: VarBlock[];
+    };
+    const kind =
+      node.kind === "ProgramDeclaration"
+        ? "program"
+        : node.kind === "FunctionBlockDeclaration"
+          ? "fb"
+          : node.kind === "FunctionDeclaration"
+            ? "function"
+            : node.kind === "MethodDeclaration"
+              ? "method"
+              : undefined;
+    if (
+      kind === undefined ||
+      !node.varBlocks ||
+      !this.ast ||
+      !this._symbolTables
+    ) {
+      return { table, exprs };
+    }
+    const walker = createLeafWalker(this.ast, this._symbolTables, {
+      leaf: (path, cppExpr, iecName) => {
+        const type = tagNameForTypeName(iecName);
+        if (type === undefined) return;
+        table.leaves.push({ path, type, size: sizeForTypeName(iecName) });
+        exprs.push(cppExpr);
+      },
+      skip: () => undefined,
+      incomplete: () => undefined,
+    });
+    for (const { block, decl, name } of frameVarDecls(node.varBlocks, kind)) {
+      const first = exprs.length;
+      // An ArrayView VAR_IN_OUT is a view object, not the array's storage.
+      const root = decl.type.name.startsWith("__VLA_")
+        ? undefined
+        : block.blockType === "VAR_INST"
+          ? `__${node.name}__${name}`
+          : kind === "program" || kind === "fb"
+            ? this.mangleMemberIfNeeded(name, decl.type.name)
+            : name;
+      if (root !== undefined) {
+        walker.visitTypeRef(name.toUpperCase(), root, decl.type, 0);
+      }
+      table.firstSlot.push(exprs.length > first ? first : null);
+    }
+    return { table, exprs };
   }
 
   /** The poll statement for site `k` (debug_probe.hpp, STRUCPP_POLL). */
