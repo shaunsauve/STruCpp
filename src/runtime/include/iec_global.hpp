@@ -56,6 +56,31 @@
 #include <mutex>
 #endif
 
+// Shared-global lock depth of the calling thread, counted in read, write and
+// with_lock, the only ways to take a GlobalVar lock. A probe never parks while
+// it is > 0. Compiled in only for threaded probe builds.
+#if defined(STRUCPP_THREADED) && defined(STRUCPP_DEBUG_PROBES)
+#define STRUCPP_GLOBALVAR_LOCK_DEPTH 1
+namespace strucpp {
+namespace dbg {
+inline int& lock_depth() noexcept {
+    static thread_local int depth = 0;
+    return depth;
+}
+/** RAII so an exception thrown under the lock (a .at() bounds fault) unwinds it. */
+struct LockDepthGuard {
+    LockDepthGuard() noexcept { ++lock_depth(); }
+    ~LockDepthGuard() { --lock_depth(); }
+    LockDepthGuard(const LockDepthGuard&) = delete;
+    LockDepthGuard& operator=(const LockDepthGuard&) = delete;
+};
+}  // namespace dbg
+}  // namespace strucpp
+#define STRUCPP_DBG_LOCK_DEPTH_GUARD ::strucpp::dbg::LockDepthGuard __dbg_lock_depth_guard;
+#else
+#define STRUCPP_DBG_LOCK_DEPTH_GUARD
+#endif
+
 namespace strucpp {
 
 template <typename V>
@@ -90,6 +115,7 @@ class GlobalVar {
     V read() const {
 #ifdef STRUCPP_THREADED
         std::lock_guard<std::mutex> lg(mtx_);
+        STRUCPP_DBG_LOCK_DEPTH_GUARD
 #endif
         return value;
     }
@@ -99,6 +125,7 @@ class GlobalVar {
     void write(T v) {
 #ifdef STRUCPP_THREADED
         std::lock_guard<std::mutex> lg(mtx_);
+        STRUCPP_DBG_LOCK_DEPTH_GUARD
 #endif
         value.set(v);
     }
@@ -111,6 +138,7 @@ class GlobalVar {
     auto with_lock(F&& f) -> decltype(f(static_cast<V*>(nullptr))) {
 #ifdef STRUCPP_THREADED
         std::lock_guard<std::mutex> lg(mtx_);
+        STRUCPP_DBG_LOCK_DEPTH_GUARD
 #endif
         return f(&value);
     }
