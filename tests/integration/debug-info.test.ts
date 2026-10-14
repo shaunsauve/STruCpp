@@ -1,7 +1,8 @@
 /**
  * debug-info.json: every corpus build validates against the
  * published schema, every declared variable is described in its scope with
- * its IEC type, and rich types carry their bounds, lengths and targets.
+ * its IEC type, rich types carry their bounds, lengths and targets, and the
+ * statement map agrees with every corpus oracle and marker.
  *
  * See also:
  *   src/backend/debug-info-gen.ts - the emitter under test.
@@ -13,6 +14,7 @@ import { describe, it, expect } from "vitest";
 import Ajv from "ajv";
 import * as fs from "fs";
 import * as path from "path";
+import { createHash } from "crypto";
 import { compile } from "../../src/index.js";
 import { compileStlib } from "../../src/library/library-compiler.js";
 import { discoverStlibs } from "../../src/node/library-loader.js";
@@ -21,6 +23,7 @@ import {
   type DebugInfoV1,
 } from "../../src/backend/debug-info-gen.js";
 import type { StlibArchive } from "../../src/library/library-manifest.js";
+import type { LineMapEntry } from "../../src/types.js";
 
 const ROOT = path.resolve(__dirname, "../..");
 const SCHEMA_PATH = path.join(ROOT, "docs/debug-info.schema.json");
@@ -89,10 +92,28 @@ function corpusLibraries(dir: string, name: string): StlibArchive[] {
   return [...stdLibs, lib.archive];
 }
 
+interface CorpusBuild {
+  label: string;
+  ok: boolean;
+  info?: DebugInfoV1;
+  error?: string;
+  sources: Array<{ fileName: string; source: string }>;
+  lineMap?: Map<number, LineMapEntry>;
+  warnings?: string[];
+}
+
+const buildCache = new Map<string, CorpusBuild[]>();
+
 /** Every build a corpus program defines: the main build and each variant. */
-function corpusBuilds(
-  name: string,
-): Array<{ label: string; ok: boolean; info?: DebugInfoV1; error?: string }> {
+function corpusBuilds(name: string): CorpusBuild[] {
+  const cached = buildCache.get(name);
+  if (cached) return cached;
+  const builds = buildCorpus(name);
+  buildCache.set(name, builds);
+  return builds;
+}
+
+function buildCorpus(name: string): CorpusBuild[] {
   const dir = path.join(CORPUS_DIR, name);
   const main = fs.readFileSync(path.join(dir, "program.st"), "utf8");
   const files = (headerValue(main, "sources") ?? "program.st").split(/\s+/);
@@ -105,10 +126,11 @@ function corpusBuilds(
       .map((f) => ({ label: `${name}/${f}`, files: [f] })),
   ];
   return builds.map(({ label, files: buildFiles }) => {
-    const [first, ...rest] = buildFiles.map((f) => ({
+    const sources = buildFiles.map((f) => ({
       fileName: f,
       source: fs.readFileSync(path.join(dir, f), "utf8"),
     }));
+    const [first, ...rest] = sources;
     try {
       const r = compile(first!.source, {
         fileName: first!.fileName,
@@ -116,11 +138,23 @@ function corpusBuilds(
         libraries,
       });
       if (!r.success) {
-        return { label, ok: false, error: r.errors[0]?.message ?? "failed" };
+        return {
+          label,
+          ok: false,
+          sources,
+          error: r.errors[0]?.message ?? "failed",
+        };
       }
-      return { label, ok: true, ...(r.debugInfo ? { info: r.debugInfo } : {}) };
+      return {
+        label,
+        ok: true,
+        sources,
+        lineMap: r.lineMap,
+        warnings: r.warnings.map((w) => w.message),
+        ...(r.debugInfo ? { info: r.debugInfo } : {}),
+      };
     } catch (e) {
-      return { label, ok: false, error: String(e) };
+      return { label, ok: false, sources, error: String(e) };
     }
   });
 }
@@ -465,5 +499,440 @@ ${CONFIG("Rich")}`),
     expect(p).toMatchObject({ kind: "subrange", name: "PCT", range: [0, 100] });
     expect(typeLabel(info, p.base!)).toBe("INT");
     expect(typeLabel(info, typeOf("R").id)).toBe("REF_TO INT");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Statement map: probes, line lists and breakpoint placement.
+// ---------------------------------------------------------------------------
+
+interface ProbeRow {
+  id: number;
+  pou: number;
+  file: number;
+  line: number;
+  col: number;
+  endLine: number;
+  endCol: number;
+  kind: number;
+}
+
+function probesOf(info: DebugInfoV1): ProbeRow[] {
+  const p = info.probes;
+  return p.line.map((line, id) => ({
+    id,
+    pou: p.pou[id]!,
+    file: p.file[id]!,
+    line,
+    col: p.col[id]!,
+    endLine: p.endLine[id]!,
+    endCol: p.endCol[id]!,
+    kind: p.kind[id]!,
+  }));
+}
+
+type Placement =
+  | { verified: true; line: number; probe: ProbeRow }
+  | { verified: false; reason: "NO_CODE" };
+
+/**
+ * Reference reader for ADR-002 D3 (F026): line L binds to the smallest
+ * probe line >= L of the innermost POU whose span holds L, at its first
+ * probe by column; with none, it is unverified NO_CODE.
+ */
+function placeBreakpoint(
+  info: DebugInfoV1,
+  file: number,
+  line: number,
+): Placement {
+  const height = (s: [number, number, number, number]): number => s[2] - s[0];
+  const pou = info.pous
+    .filter((p) => p.file === file && p.span !== null)
+    .filter((p) => p.span![0] <= line && line <= p.span![2])
+    .sort((a, b) => height(a.span!) - height(b.span!))[0];
+  const next = probesOf(info)
+    .filter((p) => pou !== undefined && p.pou === pou.id && p.line >= line)
+    .sort((a, b) => a.line - b.line || a.col - b.col || a.id - b.id)[0];
+  return next === undefined
+    ? { verified: false, reason: "NO_CODE" }
+    : { verified: true, line: next.line, probe: next };
+}
+
+const MARKER = /\(\*@([A-Za-z0-9_-]+)\*\)/g;
+
+function markersOf(source: string): Map<string, number> {
+  const out = new Map<string, number>();
+  source.split("\n").forEach((text, i) => {
+    for (const m of text.matchAll(MARKER)) out.set(`@${m[1]}`, i + 1);
+  });
+  return out;
+}
+
+/** Words a probe may never start at: declarations and block ends. */
+const NOT_A_STATEMENT =
+  /^(VAR\w*|END_\w+|ELSE|THEN|DO|OF|TYPE|STRUCT|FUNCTION\w*|PROGRAM|METHOD|PROPERTY|GET|SET)\b/i;
+
+/** Probe and placement invariants over every line of every file of one build. */
+function lineInvariants(b: CorpusBuild): string[] {
+  const info = b.info!;
+  const bad: string[] = [];
+  const probes = probesOf(info);
+  for (const f of info.files) {
+    const listed = new Set(info.lines[String(f.id)] ?? []);
+    const text = b.sources.find((s) => s.fileName === f.path)!.source;
+    const lines = text.split("\n");
+    for (const p of probes.filter((x) => x.file === f.id)) {
+      const at = (lines[p.line - 1] ?? "").slice(p.col - 1);
+      if (!/^[A-Za-z_]/.test(at) || NOT_A_STATEMENT.test(at)) {
+        bad.push(
+          `${b.label} ${f.path}:${p.line}:${p.col} probe on "${at.trim().slice(0, 20)}"`,
+        );
+      }
+      if (!listed.has(p.line))
+        bad.push(`${b.label} probe ${p.id} line ${p.line} not listed`);
+    }
+    for (let line = 1; line <= lines.length; line++) {
+      const r = placeBreakpoint(info, f.id, line);
+      const where = `${b.label} ${f.path}:${line}`;
+      if (listed.has(line) && !(r.verified && r.line === line)) {
+        bad.push(`${where} listed but not verified there`);
+      }
+      if (!listed.has(line) && r.verified && r.line <= line) {
+        bad.push(`${where} unlisted but verified at ${r.line}`);
+      }
+    }
+  }
+  if (info.files.length === 1 && b.lineMap) {
+    for (const p of probes) {
+      if (!(b.lineMap.get(p.line)?.probeIds ?? []).includes(p.id)) {
+        bad.push(
+          `${b.label} probe ${p.id} missing from lineMap line ${p.line}`,
+        );
+      }
+    }
+  }
+  for (const w of b.warnings ?? []) {
+    if (/probe/i.test(w)) bad.push(`${b.label} warning: ${w}`);
+  }
+  return bad;
+}
+
+interface OracleStep {
+  inspect?: string;
+  request?: string;
+  event?: string;
+  args?: { file?: string; lines?: unknown };
+  expect?: {
+    linesByFile?: Record<string, string[]>;
+    body?: {
+      breakpoints?: Array<{
+        verified: boolean;
+        line?: string;
+        reason?: string;
+      }>;
+    };
+    location?: {
+      file?: unknown;
+      line?: unknown;
+      col?: number;
+      endLine?: unknown;
+    };
+    stack?: Array<{ pou?: string; kind?: string; instance?: string | null }>;
+  };
+}
+
+/** Checks one oracle's debug-info claims; returns the disagreements. */
+function oracleDisagreements(
+  corpus: string,
+  oracleFile: string,
+  builds: CorpusBuild[],
+): string[] {
+  const oracle = JSON.parse(
+    fs.readFileSync(path.join(CORPUS_DIR, corpus, oracleFile), "utf8"),
+  ) as { steps?: OracleStep[] };
+  const bad: string[] = [];
+  const tag = `${corpus}/${oracleFile}`;
+  const buildOf = (file: string): CorpusBuild | undefined =>
+    builds.find((b) => b.ok && b.sources.some((s) => s.fileName === file));
+  const resolve = (b: CorpusBuild, file: string, marker: string) => {
+    const src = b.sources.find((s) => s.fileName === file)!.source;
+    const line = markersOf(src).get(marker);
+    const fileId = b.info!.files.find((f) => f.path === file)!.id;
+    return { line, fileId };
+  };
+  for (const step of oracle.steps ?? []) {
+    const ex = step.expect;
+    if (step.inspect === "debugInfo" && ex?.linesByFile) {
+      for (const [file, markers] of Object.entries(ex.linesByFile)) {
+        const b = buildOf(file)!;
+        const want = markers
+          .map((m) => resolve(b, file, m).line ?? -1)
+          .sort((x, y) => x - y);
+        const got = b.info!.lines[String(resolve(b, file, "").fileId)] ?? [];
+        if (JSON.stringify(got) !== JSON.stringify(want)) {
+          bad.push(
+            `${tag} lines of ${file}: got ${JSON.stringify(got)}, oracle ${JSON.stringify(want)}`,
+          );
+        }
+      }
+    }
+    const asked = step.args?.lines;
+    const answers = ex?.body?.breakpoints;
+    if (step.request === "setBreakpoints" && Array.isArray(asked) && answers) {
+      const file = step.args!.file!;
+      const b = buildOf(file);
+      if (!b) continue;
+      asked.forEach((marker, i) => {
+        const want = answers[i];
+        const { line, fileId } = resolve(b, file, String(marker));
+        if (want === undefined || line === undefined) return;
+        const r = placeBreakpoint(b.info!, fileId, line);
+        const wantLine = want.line
+          ? resolve(b, file, want.line).line
+          : undefined;
+        const ok = want.verified
+          ? r.verified && (wantLine === undefined || r.line === wantLine)
+          : !r.verified &&
+            (want.reason === undefined || r.reason === want.reason);
+        if (!ok) {
+          bad.push(
+            `${tag} breakpoint ${String(marker)}: got ${JSON.stringify(r.verified ? { line: r.line } : r)}, oracle ${JSON.stringify(want)}`,
+          );
+        }
+      });
+    }
+    const loc = ex?.location;
+    if (
+      step.event === "stopped" &&
+      loc &&
+      typeof loc.file === "string" &&
+      typeof loc.line === "string"
+    ) {
+      const b = buildOf(loc.file);
+      if (!b) continue;
+      const { line, fileId } = resolve(b, loc.file, loc.line);
+      const at = probesOf(b.info!)
+        .filter((p) => p.file === fileId && p.line === line)
+        .sort((x, y) => x.col - y.col);
+      const probe =
+        loc.col === undefined ? at[0] : at.find((p) => p.col === loc.col);
+      const where = `${tag} stop ${loc.line}${loc.col ? `:${loc.col}` : ""}`;
+      if (!probe) {
+        bad.push(
+          `${where}: no probe there (probes at cols ${at.map((p) => p.col).join(",")})`,
+        );
+        continue;
+      }
+      if (typeof loc.endLine === "string") {
+        const endLine = resolve(b, loc.file, loc.endLine).line;
+        if (probe.endLine !== endLine)
+          bad.push(`${where}: endLine ${probe.endLine}, oracle ${endLine}`);
+      }
+      const frame = ex?.stack?.[0];
+      const pou = b.info!.pous[probe.pou]!;
+      if (frame?.pou !== undefined && frame.pou.toUpperCase() !== pou.name) {
+        bad.push(`${where}: POU ${pou.name}, oracle ${frame.pou}`);
+      }
+      if (frame?.kind !== undefined && frame.kind !== pou.kind) {
+        bad.push(`${where}: kind ${pou.kind}, oracle ${frame.kind}`);
+      }
+      if (typeof frame?.instance === "string") {
+        const i = b.info!.instances.path.indexOf(frame.instance.toUpperCase());
+        const owner = pou.owner === null ? pou : b.info!.pous[pou.owner]!;
+        if (i < 0 || b.info!.instances.typeId[i] !== owner.typeId) {
+          bad.push(
+            `${where}: instance ${frame.instance} is not a ${owner.name}`,
+          );
+        }
+      }
+    }
+  }
+  return bad;
+}
+
+/**
+ * Corpus markers on lines that are deliberately not executable: comments,
+ * declarations, block ends and continuation lines of a spanning statement.
+ */
+const NON_EXECUTABLE_MARKERS: string[] = [];
+
+describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
+  "debug-info.json: statement map against the corpus (A011, A015, A018)",
+  () => {
+    const compiled = (): Array<{ name: string; builds: CorpusBuild[] }> =>
+      corpusNames
+        .filter((n) => EXPECTED_FAIL[n] === undefined)
+        .map((name) => ({
+          name,
+          builds: corpusBuilds(name).filter((b) => b.ok),
+        }));
+
+    it("puts every @MARKER line on a probe line, except deliberately non-executable ones", () => {
+      const unlisted: string[] = [];
+      const bad: string[] = [];
+      for (const { name, builds } of compiled()) {
+        const seen = new Set<string>();
+        for (const b of builds) {
+          bad.push(...lineInvariants(b));
+          for (const f of b.info!.files) {
+            if (seen.has(f.path)) continue;
+            seen.add(f.path);
+            const listed = new Set(b.info!.lines[String(f.id)] ?? []);
+            const src = b.sources.find((s) => s.fileName === f.path)!.source;
+            for (const [marker, line] of markersOf(src)) {
+              if (!listed.has(line))
+                unlisted.push(`${name}/${f.path} ${marker}`);
+            }
+          }
+        }
+      }
+      expect(bad).toEqual([]);
+      expect(unlisted.sort()).toEqual([...NON_EXECUTABLE_MARKERS].sort());
+    });
+
+    it("agrees with every oracle's line lists, placements and stop locations", () => {
+      const bad: string[] = [];
+      for (const { name, builds } of compiled()) {
+        const oracles = fs
+          .readdirSync(path.join(CORPUS_DIR, name))
+          .filter((f) => f.endsWith(".oracle.json"));
+        for (const o of oracles)
+          bad.push(...oracleDisagreements(name, o, builds));
+      }
+      expect(bad).toEqual([]);
+    });
+  },
+);
+
+describe("debug-info.json: probe IDs (A012) and placement at POU edges (A018)", () => {
+  const A = `
+FUNCTION_BLOCK Helper
+  VAR_INPUT x : INT; END_VAR
+  VAR_OUTPUT y : INT; END_VAR
+  METHOD PUBLIC Twice : INT
+    Twice := x * 2;
+    (* after the method's last statement *)
+  END_METHOD
+  y := x * 3;
+  (* after the block's last statement *)
+END_FUNCTION_BLOCK
+
+FUNCTION Inc : INT
+  VAR_INPUT v : INT; END_VAR
+  Inc := v + 1;
+END_FUNCTION
+`;
+  const B = `
+PROGRAM Main
+  VAR h : Helper; n : INT; k : INT; END_VAR
+  h(x := n);
+  n := Inc(n); k := h.Twice();
+  WHILE n > 100 DO
+    n := n - 100;
+  END_WHILE;
+  REPEAT
+    k := k - 1;
+  UNTIL k <= 0
+  END_REPEAT;
+END_PROGRAM
+${CONFIG("Main")}`;
+  const build = (a: string, b: string): DebugInfoV1 => {
+    const r = compile(a, {
+      fileName: "a.st",
+      additionalSources: [{ fileName: "b.st", source: b }],
+    });
+    expect(r.errors).toEqual([]);
+    return r.debugInfo!;
+  };
+  const tableHash = (info: DebugInfoV1): string =>
+    createHash("sha256")
+      .update(JSON.stringify({ probes: info.probes, lines: info.lines }))
+      .digest("hex");
+  const located = (info: DebugInfoV1, file: number): string[] =>
+    probesOf(info)
+      .filter((p) => p.file === file)
+      .map(
+        (p) =>
+          `${info.pous[p.pou]!.name} ${p.line}:${p.col}-${p.endLine}:${p.endCol} k${p.kind}`,
+      );
+
+  it("gives byte-identical probe tables to rebuilds of identical source", () => {
+    const first = build(A, B);
+    debugInfoOf(ALL_SCOPES);
+    const second = build(`${A} `.trimEnd() + "\n", `${B}`);
+    expect(first.probes.line.length).toBeGreaterThan(0);
+    expect(tableHash(second)).toBe(tableHash(first));
+  });
+
+  it("numbers probes by file, then POU declaration, then source position", () => {
+    const info = build(A, B);
+    const key = (p: ProbeRow): number[] => {
+      const s = info.pous[p.pou]!.span!;
+      return [p.file, s[0], s[1], p.line, p.col, p.kind];
+    };
+    const keys = probesOf(info).map(key);
+    const sorted = [...keys].sort((x, y) => {
+      for (let i = 0; i < x.length; i++)
+        if (x[i] !== y[i]) return x[i]! - y[i]!;
+      return 0;
+    });
+    expect(keys).toEqual(sorted);
+    for (const pou of info.pous.filter((p) => !p.noSource)) {
+      const own = probesOf(info).filter((p) => p.pou === pou.id);
+      expect(pou.entryProbe, pou.name).toBe(own[0]?.id ?? null);
+    }
+  });
+
+  it("keeps an edited build's other file and its statement locations; the IDs may move", () => {
+    const before = build(A, B);
+    const after = build(
+      A,
+      B.replace("  h(x := n);", "  n := n + 1;\n  h(x := n);"),
+    );
+    expect(after.files[0]!.sha256).toBe(before.files[0]!.sha256);
+    expect(after.files[1]!.sha256).not.toBe(before.files[1]!.sha256);
+    expect(after.build.buildId).not.toBe(before.build.buildId);
+    expect(located(after, 0)).toEqual(located(before, 0));
+    expect(located(after, 1).length).toBe(located(before, 1).length + 1);
+  });
+
+  it("gives loops a condition probe and never moves a breakpoint across a POU edge", () => {
+    const info = build(A, B);
+    const line = (file: string, text: string): number =>
+      (file === "a.st" ? A : B).split("\n").findIndex((l) => l.includes(text)) +
+      1;
+    const kinds = (text: string): number[] =>
+      probesOf(info)
+        .filter((p) => p.file === 1 && p.line === line("b.st", text))
+        .map((p) => p.kind);
+    expect(kinds("WHILE n > 100")).toEqual([0, 1]);
+    expect(kinds("REPEAT")).toEqual([0]);
+    expect(kinds("UNTIL k <= 0")).toEqual([1]);
+    expect(
+      probesOf(info)
+        .filter((p) => p.file === 1 && p.line === line("b.st", "n := Inc(n)"))
+        .map((p) => p.col),
+    ).toEqual([3, 16]);
+    const at = (text: string): Placement =>
+      placeBreakpoint(info, 0, line("a.st", text));
+    expect(at("after the method's last")).toEqual({
+      verified: false,
+      reason: "NO_CODE",
+    });
+    expect(at("after the block's last")).toEqual({
+      verified: false,
+      reason: "NO_CODE",
+    });
+    expect(at("END_FUNCTION_BLOCK")).toEqual({
+      verified: false,
+      reason: "NO_CODE",
+    });
+    expect(at("VAR_INPUT x")).toMatchObject({
+      verified: true,
+      line: line("a.st", "y := x * 3"),
+    });
+    expect(
+      info.pous[(at("Twice := x") as { probe: ProbeRow }).probe.pou],
+    ).toMatchObject({ name: "TWICE", kind: "method" });
   });
 });
