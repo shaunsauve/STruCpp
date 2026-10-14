@@ -213,9 +213,11 @@ describe("Phase 3.5: Combined __NEW/__DELETE Usage", () => {
       END_PROGRAM
     `);
     expect(result.success).toBe(true);
-    // Should have two iec_new calls and two iec_delete calls
-    const newCount = (result.cppCode.match(/strucpp::iec_new</g) || []).length;
-    const deleteCount = (result.cppCode.match(/strucpp::iec_delete/g) || []).length;
+    // Should have two iec_new calls and two iec_delete calls in the body.
+    // A probe build repeats every body in its probed clone (ADR-001 D10.6).
+    const body = result.cppCode.replace(/\/\/ strucpp:probed-clone begin[\s\S]*?\/\/ strucpp:probed-clone end/g, "");
+    const newCount = (body.match(/strucpp::iec_new</g) || []).length;
+    const deleteCount = (body.match(/strucpp::iec_delete/g) || []).length;
     expect(newCount).toBe(2);
     expect(deleteCount).toBe(2);
   });

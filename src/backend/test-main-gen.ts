@@ -187,6 +187,10 @@ export function generateTestMain(
   // Includes
   lines.push(`#include "${options.headerFileName}"`);
   lines.push('#include "iec_test.hpp"');
+  // A probe build calls the debug ABI; the stub host answers it.
+  lines.push("#ifdef STRUCPP_DEBUG_PROBES");
+  lines.push('#include "debug_probe_stub.hpp"');
+  lines.push("#endif");
   lines.push("#include <cstring>");
   lines.push("");
   lines.push("using namespace strucpp;");

@@ -89,6 +89,28 @@ export interface CompileOptions {
    * Production compiles leave it off and see no output change.
    */
   emitChunkMarkers?: boolean;
+
+  /**
+   * Compile debugger probes into the program (default: true). Each POU is
+   * emitted as an unprobed clone with call-free polls and a probed clone the
+   * runtime's debug engine runs while a session is attached. False
+   * (CLI `--no-probes`) emits no probe code; watch and force still work
+   * through the debug table, and `strucpp_dbg_probe_count()` returns 0.
+   */
+  debugProbes?: boolean;
+
+  /**
+   * Leaf rule: no entry poll in leaf functions and function blocks (no
+   * POU call, no loop, at most 32 statements); probed callers enter their
+   * probed clone directly. Default false, pending its measurement.
+   */
+  debugProbeLeafRule?: boolean;
+
+  /**
+   * Test only: evaluate shared-global subscripts and output-capture sources
+   * inside the global's lock, as earlier releases did. Never set in a build.
+   */
+  testOnlyDisableLockHoist?: boolean;
 }
 
 /**

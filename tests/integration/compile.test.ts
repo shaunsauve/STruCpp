@@ -628,8 +628,8 @@ describe('Error Handling Tests', () => {
       expect(result.success).toBe(true);
       // copy-in: locked read of the whole global into the FB's by-value inout member
       expect(result.cppCode).toContain('MV.A = AX->with_lock([&](auto* __glk){ return (*__glk); });');
-      // copy-out: locked write back
-      expect(result.cppCode).toContain('AX->with_lock([&](auto* __glk){ (*__glk) = MV.A; });');
+      // copy-out: locked write back of the member, read before the lock (ADR-001 D1.3(1))
+      expect(result.cppCode).toMatch(/auto (__gcs_\d+) = MV\.A;\n\s*AX->with_lock\(\[&\]\(auto\* __glk\)\{ \(\*__glk\) = \1; \}\);/);
     });
 
     it('never nests two global locks in one statement (reads hoisted before write-lock)', () => {

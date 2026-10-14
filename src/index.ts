@@ -771,6 +771,9 @@ export function compile(
     ...(pipeline.mergedOptions.emitChunkMarkers
       ? { emitChunkMarkers: true }
       : {}),
+    debugProbes: pipeline.mergedOptions.debugProbes ?? true,
+    debugProbeLeafRule: pipeline.mergedOptions.debugProbeLeafRule ?? false,
+    lockHoist: !(pipeline.mergedOptions.testOnlyDisableLockHoist ?? false),
   });
   codegen.setProjectModel(pipeline.projectModel!);
 
@@ -852,6 +855,8 @@ export function compile(
       options: {
         isTestBuild: opts.isTestBuild ?? false,
         globalConstants: opts.globalConstants ?? {},
+        debugProbes: opts.debugProbes ?? true,
+        ...(opts.debugProbeLeafRule ? { debugProbeLeafRule: true } : {}),
       },
       ...(opts.globalConstants
         ? { globalConstants: opts.globalConstants }

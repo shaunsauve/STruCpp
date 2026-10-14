@@ -820,7 +820,7 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
 
   // --- Build identity --------------------------------------------------------
 
-  const options = { ...input.options, debugProbes: false };
+  const options = { debugProbes: false, ...input.options };
   const compiler = `strucpp ${input.compilerVersion}`;
   const buildId = sha256Hex(
     [
@@ -837,7 +837,13 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     format: DEBUG_INFO_FORMAT,
     major: DEBUG_INFO_MAJOR,
     minor: DEBUG_INFO_MINOR,
-    build: { md5: input.md5, buildId, compiler, options, probes: false },
+    build: {
+      md5: input.md5,
+      buildId,
+      compiler,
+      options,
+      probes: options.debugProbes === true,
+    },
     files,
     pous,
     probes,

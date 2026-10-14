@@ -255,8 +255,9 @@ describe("Codegen - Function Blocks", () => {
         END_PROGRAM
       `);
 
-      // Two separate invocations of the same instance
-      const cppCode = result.cppCode;
+      // Two separate invocations of the same instance. A probe build repeats
+      // every body in its probed clone (ADR-001 D10.6); count the body once.
+      const cppCode = result.cppCode.replace(/\/\/ strucpp:probed-clone begin[\s\S]*?\/\/ strucpp:probed-clone end/g, "");
       const invocations = cppCode.match(/C\(\);/g);
       expect(invocations).toHaveLength(2);
     });

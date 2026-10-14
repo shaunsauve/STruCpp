@@ -353,7 +353,9 @@ function compileNativeEntries(
   if (errors.length > 0) return { ...empty, errors };
   if (projected.length === 0) return empty;
 
-  const compileOpts: Partial<import("../types.js").CompileOptions> = {};
+  const compileOpts: Partial<import("../types.js").CompileOptions> = {
+    debugProbes: false,
+  };
   if (options.dependencies) compileOpts.libraries = options.dependencies;
   if (options.globalConstants)
     compileOpts.globalConstants = options.globalConstants;
@@ -537,6 +539,8 @@ export function compileLibrary(
     // they're persisted, so downstream consumers (legacy and
     // chunk-aware alike) see clean output.
     emitChunkMarkers: true,
+    // Library POUs run without probes, like any POU with no source.
+    debugProbes: false,
   };
   if (options.dependencies) {
     compileOpts.libraries = options.dependencies;
