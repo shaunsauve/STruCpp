@@ -243,6 +243,13 @@ attaches (sets bit 0), the next poll leaves by a tail return into the **probed c
 value) and runs a probe before every statement and loop / `ELSIF` condition, plus a frame
 record. Probe IDs are those of `debug-info.json`.
 
+Programs and FB bodies leave by a tail return. Functions, methods and property accessors
+return in memory and take objects by value, which GCC never turns into a sibling call, so
+on arm64 their poll instead branches to an asm block that saves the registers it touches
+on its own stack and calls a transfer stub (`__dbg_xfer`) with the encoded state: a
+function frameless in a `--no-probes` build stays frameless on the idle path. Other
+targets use the tail return.
+
 The program defines the flag bytes (`strucpp_dbg_flags[]`, `ARMED` / `TRAP` bits), the
 active byte, `strucpp_dbg_probe_count()`, `strucpp_dbg_abi_version()` and
 `strucpp_dbg_lock_depth()`. The host defines `strucpp_dbg_hit()` (a probe's slow path; it

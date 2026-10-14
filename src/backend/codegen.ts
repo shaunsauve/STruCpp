@@ -394,6 +394,44 @@ interface DualBody {
   self: "this" | "nullptr";
   noEntryPoll: boolean;
   probedEpilogue: string[];
+  /** Register-saving transfer (STRUCPP_POLL's long form), when the POU has one. */
+  x?: XferStub | undefined;
+}
+
+/**
+ * The transfer stub of a function, method or property accessor: called from
+ * the poll's asm block with the encoded state, it calls the probed clone.
+ * `args` are the probed clone's parameters after the site ("type name").
+ */
+interface XferStub {
+  /** Name the poll takes the address of. */
+  name: string;
+  /** Definition head, qualified. */
+  head: string;
+  /** The probed clone, called on `self` when set. */
+  callee: string;
+  /** Pointer type of `this`, for members. */
+  self?: string;
+  ret?: { name: string; type: string };
+  /** Parameters and the result go by address (STRUCPP_XP), locals as XArg (STRUCPP_XA). */
+  args: Array<{ decl: string; byAddr: boolean }>;
+}
+
+/** GCC allows 30 asm operands: the stub, `retp`, the site and 27 arguments. */
+const XFER_MAX_ARGS = 27;
+
+/** A transfer stub for these probed-clone parameters (after the site), if they fit. */
+function xferStub(
+  spec: Omit<XferStub, "args">,
+  args: XferStub["args"],
+): XferStub | undefined {
+  return args.length + (spec.self ? 1 : 0) <= XFER_MAX_ARGS
+    ? { ...spec, args }
+    : undefined;
+}
+
+function paramType(param: string): string {
+  return param.slice(0, param.lastIndexOf(" ")).trim();
 }
 
 // =============================================================================
@@ -1900,6 +1938,11 @@ export class CodeGenerator {
       this.emitHeader(
         `STRUCPP_DBG_HIDDEN ${ret} ${base}__dbg_probed(${this.functionProbedParams(func).join(", ")});`,
       );
+      if (this.functionXfer(func, base)) {
+        this.emitHeader(
+          `STRUCPP_DBG_HIDDEN void ${base}__dbg_xfer(const uint64_t* __s);`,
+        );
+      }
       if (this.leafPous.has(func.name.toUpperCase())) {
         this.emitHeader(
           `STRUCPP_DBG_HIDDEN ${ret} ${func.name}__dbg_entry(${params.join(", ")});`,
@@ -2091,6 +2134,11 @@ export class CodeGenerator {
           this.emitHeader(
             `    ${returnType} ${method.name}__dbg_probed(${this.methodProbedParams(method).join(", ")});`,
           );
+          if (this.methodXfer(method, "")) {
+            this.emitHeader(
+              `    static void ${method.name}__dbg_xfer(const uint64_t* __s);`,
+            );
+          }
         }
         this.recordHeaderLineMapping(method.sourceSpan.startLine, methodLine);
       }
@@ -2162,6 +2210,9 @@ export class CodeGenerator {
           this.emitHeader(
             `    ${type} get_${prop.name}__dbg_probed(uint32_t __osr_site, ${type} ${prop.name}_result) const;`,
           );
+          this.emitHeader(
+            `    static void get_${prop.name}__dbg_xfer(const uint64_t* __s);`,
+          );
         }
       }
       if (prop.setter) {
@@ -2171,6 +2222,9 @@ export class CodeGenerator {
         if (this.dual) {
           this.emitHeader(
             `    void set_${prop.name}__dbg_probed(uint32_t __osr_site, ${type} ${prop.name});`,
+          );
+          this.emitHeader(
+            `    static void set_${prop.name}__dbg_xfer(const uint64_t* __s);`,
           );
         }
       }
@@ -2261,6 +2315,7 @@ export class CodeGenerator {
               method.returnType !== undefined && isIfaceReturn !== true
                 ? [`    return ${method.name}_result;`]
                 : [],
+            x: this.methodXfer(method, className),
           }
         : undefined,
     );
@@ -2314,6 +2369,16 @@ export class CodeGenerator {
               self: "this",
               noEntryPoll: false,
               probedEpilogue: [`    return ${prop.name}_result;`],
+              x: xferStub(
+                {
+                  name: `get_${prop.name}__dbg_xfer`,
+                  head: `void ${className}::get_${prop.name}__dbg_xfer(const uint64_t* __s)`,
+                  callee: `get_${prop.name}__dbg_probed`,
+                  self: `const ${className}*`,
+                  ret: { name: `${prop.name}_result`, type },
+                },
+                [{ decl: `${type} ${prop.name}_result`, byAddr: true }],
+              ),
             }
           : undefined,
       );
@@ -2344,6 +2409,15 @@ export class CodeGenerator {
               self: "this",
               noEntryPoll: false,
               probedEpilogue: [],
+              x: xferStub(
+                {
+                  name: `set_${prop.name}__dbg_xfer`,
+                  head: `void ${className}::set_${prop.name}__dbg_xfer(const uint64_t* __s)`,
+                  callee: `set_${prop.name}__dbg_probed`,
+                  self: `${className}*`,
+                },
+                [{ decl: `${type} ${prop.name}`, byAddr: true }],
+              ),
             }
           : undefined,
       );
@@ -2589,6 +2663,7 @@ export class CodeGenerator {
                 self: "nullptr",
                 noEntryPoll: this.leafPous.has(func.name.toUpperCase()),
                 probedEpilogue: [`    return ${funcName}_result;`],
+                x: this.functionXfer(func, cppName),
               }
             : undefined,
         );
@@ -6894,7 +6969,7 @@ export class CodeGenerator {
     this.dualBody = body;
     this.dbgSiteCounter = 0;
     if (!body.noEntryPoll) {
-      this.emit(`${indent}STRUCPP_POLL(0, ${body.xfer(0)});`);
+      this.emit(`${indent}${this.pollStmt(body, 0)}`);
     }
     this.generateStatements(stmts);
     const counters = [
@@ -6923,6 +6998,7 @@ export class CodeGenerator {
     this.generateStatements(stmts);
     for (const l of body.probedEpilogue) this.emit(l);
     this.emit("}");
+    if (body.x) this.emitXferStub(body.x);
     this.emit("// strucpp:probed-clone end");
     // Resume at the poll site that transferred here; site 0 is the entry.
     this.output[dispatchAt] =
@@ -6945,6 +7021,44 @@ export class CodeGenerator {
     return probed;
   }
 
+  /** The poll statement for site `k` (debug_probe.hpp, STRUCPP_POLL). */
+  private pollStmt(body: DualBody, k: number): string {
+    const x = body.x;
+    if (!x) return `STRUCPP_POLL(${k}, ${body.xfer(k)});`;
+    const enc = [
+      ...(x.self ? ["STRUCPP_XA(this)"] : []),
+      ...x.args.map(
+        (a) => `STRUCPP_X${a.byAddr ? "P" : "A"}(${paramName(a.decl)})`,
+      ),
+    ];
+    const ret = x.ret ? [`&${x.ret.name}`, x.ret.name] : ["0", "(void)0"];
+    return `STRUCPP_POLL(${[
+      String(k),
+      body.xfer(k),
+      String(2 + enc.length),
+      x.name,
+      ...ret,
+      ...enc,
+    ].join(", ")});`;
+  }
+
+  private emitXferStub(x: XferStub): void {
+    const xa = (type: string, slot: number, byAddr = false): string =>
+      `::strucpp::dbg::X${byAddr ? "Addr" : "Arg"}<${type}>::get(__s[${slot}])`;
+    const first = x.self ? 4 : 3;
+    const args = [
+      "static_cast<uint32_t>(__s[2])",
+      ...x.args.map((a, i) => xa(paramType(a.decl), first + i, a.byAddr)),
+    ];
+    const callee = x.self ? `${xa(x.self, 3)}->${x.callee}` : x.callee;
+    const call = `${callee}(${args.join(", ")})`;
+    this.emit(`STRUCPP_DBG_PROBED ${x.head} {`);
+    this.emit(
+      x.ret ? `    *${xa(`${x.ret.type}*`, 1)} = ${call};` : `    ${call};`,
+    );
+    this.emit("}");
+  }
+
   /**
    * Poll site at this point of the body: a poll in the unprobed clone and the
    * matching re-entry label in the probed clone. Both clones number sites in
@@ -6955,7 +7069,7 @@ export class CodeGenerator {
     const k = ++this.dbgSiteCounter;
     if (this.dbgScopeUnsafe.some((unsafe) => unsafe)) return;
     if (this.probeMode === "unprobed") {
-      this.emit(`${indent}STRUCPP_POLL(${k}, ${this.dualBody!.xfer(k)});`);
+      this.emit(`${indent}${this.pollStmt(this.dualBody!, k)}`);
     } else {
       this.emit(`${indent}__osr_${k}:;`);
       this.dbgLabels.push(k);
@@ -7110,6 +7224,81 @@ export class CodeGenerator {
         ? [`${this.mapTypeRefToCpp(method.returnType)} ${method.name}_result`]
         : []),
     ];
+  }
+
+  /** Transfer stub of a function whose C++ body is `cppName`. */
+  private functionXfer(
+    func: CompilationUnit["functions"][0],
+    cppName: string,
+  ): XferStub | undefined {
+    return xferStub(
+      {
+        name: `${cppName}__dbg_xfer`,
+        head: `void ${cppName}__dbg_xfer(const uint64_t* __s)`,
+        callee: `${cppName}__dbg_probed`,
+        ret: {
+          name: `${func.name}_result`,
+          type: this.mapTypeRefToCpp(func.returnType),
+        },
+      },
+      [
+        ...this.generateFunctionParams(func).map((decl) => ({
+          decl,
+          byAddr: true,
+        })),
+        ...this.stackLocals(func.varBlocks).map((decl) => ({
+          decl,
+          byAddr: false,
+        })),
+        {
+          decl: `${this.mapTypeRefToCpp(func.returnType)} ${func.name}_result`,
+          byAddr: true,
+        },
+      ],
+    );
+  }
+
+  /** Transfer stub of a method; none for an interface return (by reference). */
+  private methodXfer(
+    method: MethodDeclaration,
+    className: string,
+  ): XferStub | undefined {
+    if (method.returnType && this.isInterfaceType(method.returnType.name))
+      return undefined;
+    return xferStub(
+      {
+        name: `${method.name}__dbg_xfer`,
+        head: `void ${className}::${method.name}__dbg_xfer(const uint64_t* __s)`,
+        callee: `${method.name}__dbg_probed`,
+        self: `${className}*`,
+        ...(method.returnType
+          ? {
+              ret: {
+                name: `${method.name}_result`,
+                type: this.mapTypeRefToCpp(method.returnType),
+              },
+            }
+          : {}),
+      },
+      [
+        ...this.generateMethodParams(method).map((decl) => ({
+          decl,
+          byAddr: true,
+        })),
+        ...this.stackLocals(method.varBlocks).map((decl) => ({
+          decl,
+          byAddr: false,
+        })),
+        ...(method.returnType
+          ? [
+              {
+                decl: `${this.mapTypeRefToCpp(method.returnType)} ${method.name}_result`,
+                byAddr: true,
+              },
+            ]
+          : []),
+      ],
+    );
   }
 
   private functionProbedParams(

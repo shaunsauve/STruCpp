@@ -247,7 +247,7 @@ function stripProbes(code: string): string {
     .replace(BLOCK, "")
     .split("\n")
     .filter((l) => !/^\s*STRUCPP_POLL\(/.test(l))
-    .filter((l) => !/__dbg_(probed|entry)\(/.test(l))
+    .filter((l) => !/__dbg_(probed|entry|xfer)\(/.test(l))
     .map((l) => l.replace(/^STRUCPP_DBG_UNPROBED /, ""))
     .join("\n");
 }
@@ -299,9 +299,15 @@ describe("probe-on codegen: per-POU dual path (ADR-001 D10.6, A″ form)", () =>
     }
     // A taken poll leaves by a tail return into the probed clone.
     expect(unprobed).toMatch(/STRUCPP_POLL\(0, __dbg_probed\(0\)\);/);
-    // Functions hand over their parameters and locals by value.
+    // Functions hand over their parameters and locals by value: the probed
+    // clone's call, and the transfer stub's state (parameters and result by
+    // address, locals encoded) for the register-saving form.
     const sum = r.cppFiles.find((f) => f.name === "pou_SUMTO.cpp")!.content;
-    expect(sum).toMatch(/STRUCPP_POLL\(\d+, SUMTO__dbg_probed\(\d+, N, I, ACC, TMP, SUMTO_result\)\);/);
+    expect(sum).toMatch(new RegExp(
+      "STRUCPP_POLL\\((\\d+), SUMTO__dbg_probed\\(\\1, N, I, ACC, TMP, SUMTO_result\\), 7, SUMTO__dbg_xfer, " +
+      "&SUMTO_result, SUMTO_result, STRUCPP_XP\\(N\\), STRUCPP_XA\\(I\\), STRUCPP_XA\\(ACC\\), STRUCPP_XA\\(TMP\\), " +
+      "STRUCPP_XP\\(SUMTO_result\\)\\);"));
+    expect(sum).toContain("void SUMTO__dbg_xfer(const uint64_t* __s) {");
     // The probed clone links a frame; the unprobed clone has none.
     expect(probed).toContain("STRUCPP_FRAME(");
     expect(unprobed).not.toContain("STRUCPP_FRAME(");
@@ -441,6 +447,222 @@ describe.skipIf(!shapeArch)(`A027: poll shape in the object code (${shapeArch ??
     const s = objects("shape-red", r, rt);
     expect(s.slowCalls.length + s.bad.length + Math.abs(s.sites - planted(r))).toBeGreaterThan(0);
   });
+});
+
+// ---------------------------------------------------------------------------
+// A″ frame: on the runtime's toolchain (GCC 12, arm64, Makefile.strucpp flags),
+// every function frameless in the probe-off build stays frameless on the
+// probe-on idle path.
+// ---------------------------------------------------------------------------
+
+const GCC12_IMAGE = "strucpp-gcc12-arm64:local";
+const GCC12_DOCKERFILE = path.resolve(__dirname, "docker/gcc12-arm64.Dockerfile");
+const hasDocker = spawnSync("docker", ["info"], { stdio: "ignore", timeout: 20000 }).status === 0;
+
+/** Compile every .cpp under `root` in the GCC 12 image; returns objdump -dr per object. */
+function gcc12Disassemble(root: string, include: string): Map<string, string> {
+  const cxx = [...RUNTIME_FLAGS.filter((f) => f !== "-fno-gnu-unique"), "-fno-gnu-unique"].join(" ");
+  const script = [
+    "set -e",
+    "cd /w",
+    `find . -name '*.cpp' | xargs -P2 -I{} sh -c 'g++ ${cxx} -I/rt -I"$(dirname {})" -c {} -o {}.o && objdump -dr --no-show-raw-insn {}.o > {}.dis'`,
+  ].join("\n");
+  const res = spawnSync("docker", [
+    "run", "--rm", "--platform", "linux/arm64", "--cpus", "2",
+    "-v", `${root}:/w`, "-v", `${include}:/rt:ro`, GCC12_IMAGE, "sh", "-c", script,
+  ], { encoding: "utf8", maxBuffer: 64 << 20, timeout: 900000 });
+  expect(`${res.stdout}${res.stderr}`, "gcc 12 build").toBe(res.status === 0 ? `${res.stdout}${res.stderr}` : "<built>");
+  const out = new Map<string, string>();
+  const walk = (d: string): void => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith(".dis")) out.set(path.relative(root, p), fs.readFileSync(p, "utf8"));
+    }
+  };
+  walk(root);
+  return out;
+}
+
+interface FrameReport {
+  /** Function (mangled) -> the frame instructions on its idle path; [] = frameless. */
+  frames: Map<string, string[]>;
+}
+
+/**
+ * Frame instructions an aarch64 function executes on its idle path: control
+ * flow from entry, not following the active branch of a poll (the branch after
+ * a load of strucpp_dbg_active). A frame is an sp adjustment or a spill of
+ * x19-x30 / d8-d15 to the stack. An indirect `br` is taken to reach every
+ * instruction, so it can only over-report.
+ */
+function idleFrames(dis: string): FrameReport {
+  type Insn = { addr: number; mn: string; ops: string; relocs: string[] };
+  const funcs = new Map<string, Insn[]>();
+  let fn = "";
+  for (const raw of dis.split("\n")) {
+    const head = /^[0-9a-f]+ <(.+)>:$/.exec(raw.trim());
+    if (head) {
+      fn = head[1]!;
+      funcs.set(fn, []);
+      continue;
+    }
+    if (!fn) continue;
+    const list = funcs.get(fn)!;
+    const reloc = /^\s*[0-9a-f]+:\s+R_\S+\s+(\S+)/.exec(raw);
+    if (reloc) {
+      list[list.length - 1]?.relocs.push(reloc[1]!);
+      continue;
+    }
+    const m = /^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$/.exec(raw);
+    if (m) list.push({ addr: parseInt(m[1]!, 16), mn: m[2]!, ops: m[3]!.trim(), relocs: [] });
+  }
+  const frames = new Map<string, string[]>();
+  for (const [name, insns] of funcs) {
+    const at = new Map(insns.map((ins, i) => [ins.addr, i]));
+    const target = (ops: string): number | undefined => {
+      const t = /\b([0-9a-f]+) <[^>]*>$/.exec(ops);
+      return t ? at.get(parseInt(t[1]!, 16)) : undefined;
+    };
+    // Registers holding &strucpp_dbg_active (adrp + add hoisted out of a loop),
+    // trusted only when nothing else in the function writes them, the
+    // transfer block's register restore (ldp from its sp save area) aside.
+    const dests = (ins: Insn): string[] => {
+      const regs = /^([xw]\d+), (?:([xw]\d+), )?/.exec(ins.ops);
+      if (!regs || /^(st|cmp|tst|cb|tb)/.test(ins.mn)) return [];
+      return (ins.mn === "ldp" ? [regs[1], regs[2]] : [regs[1]])
+        .filter((r): r is string => !!r)
+        .map((r) => r.replace(/^w/, "x"));
+    };
+    const isActive = (ins: Insn): boolean => ins.relocs.some((r) => r.includes("strucpp_dbg_active"));
+    const addrRegs = new Set(
+      insns
+        .filter((ins) => ins.mn === "add" && isActive(ins))
+        .flatMap(dests)
+        .filter((reg) => insns.every((o) =>
+          !dests(o).includes(reg) || isActive(o) || (o.mn === "ldp" && o.ops.includes("[sp, #")))),
+    );
+    const activeLoad = (ins: Insn): boolean =>
+      /^ldr/.test(ins.mn) &&
+      (isActive(ins) ||
+        [...addrRegs].some((reg) => ins.ops.endsWith(`[${reg}]`)));
+    // Poll branches: the first branch within two instructions of an active-byte load.
+    const pollTaken = new Set<number>();
+    insns.forEach((ins, i) => {
+      if (!activeLoad(ins)) return;
+      for (let j = i + 1; j <= i + 2 && j < insns.length; j++) {
+        if (/^(tbnz|tbz|cbnz|cbz|b\.)/.test(insns[j]!.mn)) {
+          pollTaken.add(j);
+          break;
+        }
+      }
+    });
+    const seen = new Set<number>();
+    const work = [0];
+    while (work.length) {
+      const i = work.pop()!;
+      if (i >= insns.length || seen.has(i)) continue;
+      seen.add(i);
+      const { mn, ops } = insns[i]!;
+      if (mn === "ret") continue;
+      if (mn === "br") {
+        insns.forEach((_, k) => work.push(k));
+        continue;
+      }
+      if (mn === "b") {
+        const t = target(ops);
+        if (t !== undefined) work.push(t);
+        continue;
+      }
+      if (/^(tbnz|tbz|cbnz|cbz|b\.)/.test(mn)) {
+        // A poll's idle direction is "bit clear / zero": tbnz/cbnz/b.ne fall through.
+        if (pollTaken.has(i)) {
+          if (/^(tbnz|cbnz|b\.ne)$/.test(mn)) work.push(i + 1);
+          else work.push(target(ops) ?? i + 1);
+          continue;
+        }
+        const t = target(ops);
+        if (t !== undefined) work.push(t);
+      }
+      work.push(i + 1);
+    }
+    const hits: string[] = [];
+    for (const i of seen) {
+      const { mn, ops } = insns[i]!;
+      const spAdjust = /\[sp, #-\d+\]!/.test(ops) || (mn === "sub" && /^sp, sp\b/.test(ops));
+      const spill = /^(stp|str)$/.test(mn) && ops.includes("[sp") &&
+        /\b(x(19|2\d|30)|d(8|9|1[0-5]))\b/.test(ops.split("[")[0]!);
+      if (spAdjust || spill) hits.push(`${mn} ${ops}`);
+    }
+    frames.set(name, hits);
+  }
+  return { frames };
+}
+
+describe.skipIf(!hasDocker)("A″ frame: frameless probe-off functions stay frameless probe-on (GCC 12 arm64)", () => {
+  function frames(variant: string, corpus: Array<[string, string]>, opts: Partial<CompileOptions>, include = RUNTIME_INCLUDE_PATH): Map<string, string[]> {
+    const root = path.join(tmpRoot, `frames-${variant}`);
+    corpus.forEach(([name, src], n) => {
+      const r = compile(src, { headerFileName: "generated.hpp", libraries: [IEC_STDLIB], ...opts });
+      if (!r.success) return;
+      const dir = path.join(root, `p${n}`);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "generated.hpp"), r.headerCode);
+      fs.writeFileSync(path.join(dir, "NAME"), name);
+      for (const f of r.cppFiles) fs.writeFileSync(path.join(dir, f.name), f.content);
+    });
+    const all = new Map<string, string[]>();
+    for (const [obj, dis] of gcc12Disassemble(root, include)) {
+      const prog = fs.readFileSync(path.join(root, path.dirname(obj), "NAME"), "utf8");
+      for (const [fn, hits] of idleFrames(dis).frames) all.set(`${prog} ${fn}`, hits);
+    }
+    return all;
+  }
+
+  /** Functions frameless OFF that have an idle-path frame ON, and the frameless counts. */
+  function regressions(off: Map<string, string[]>, on: Map<string, string[]>): { offFrameless: number; onFrameless: number; lost: string[] } {
+    let offFrameless = 0;
+    let onFrameless = 0;
+    const lost: string[] = [];
+    for (const [fn, hits] of off) {
+      if (hits.length) continue;
+      offFrameless++;
+      const h = on.get(fn);
+      expect(h, `${fn} missing from the probe-on build`).toBeDefined();
+      if (h!.length === 0) onFrameless++;
+      else lost.push(`${fn}: ${h!.join(" ; ")}`);
+    }
+    return { offFrameless, onFrameless, lost };
+  }
+
+  beforeAll(() => {
+    const b = spawnSync("docker", [
+      "build", "-q", "--platform", "linux/arm64", "-t", GCC12_IMAGE,
+      "-f", GCC12_DOCKERFILE, path.dirname(GCC12_DOCKERFILE),
+    ], { encoding: "utf8", timeout: 900000 });
+    expect(`${b.stdout}${b.stderr}`, "docker build").toBe(b.status === 0 ? `${b.stdout}${b.stderr}` : "<built>");
+  }, 900000);
+
+  it("every corpus function frameless in probe-off is frameless on the probe-on idle path", () => {
+    const corpus: Array<[string, string]> = [["inline:shapes", SHAPES], ...validationSources()];
+    const off = frames("off", corpus, { debugProbes: false });
+    const on = frames("on", corpus, {});
+    const r = regressions(off, on);
+    console.log(`frameless: OFF ${r.offFrameless}, ON ${r.onFrameless}`);
+    expect(r.offFrameless).toBeGreaterThan(20);
+    expect(r.lost).toEqual([]);
+  }, 900000);
+
+  it("red: with the transfer as a plain `return` of the probed clone, frameless functions gain a frame", () => {
+    const corpus: Array<[string, string]> = [["inline:shapes", SHAPES]];
+    const rt = patchedRuntime("xfer-return", "debug_probe.hpp",
+      "#if defined(__aarch64__) && defined(__GNUC__)\n#define STRUCPP_POLL_X", "#if 0\n#define STRUCPP_POLL_X");
+    const r = regressions(frames("red-off", corpus, { debugProbes: false }), frames("red-on", corpus, {}, rt));
+    expect(r.lost.map((l) => l.split(": ")[0])).toEqual(expect.arrayContaining([
+      "inline:shapes _ZN7strucpp5CLAMPENS_6IECVarIiEES1_S1_",
+      "inline:shapes _ZN7strucpp7COUNTER4BUMPENS_6IECVarIiEE",
+    ]));
+  }, 900000);
 });
 
 // ---------------------------------------------------------------------------

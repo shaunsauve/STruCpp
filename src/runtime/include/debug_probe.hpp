@@ -52,6 +52,7 @@
 #define STRUCPP_DEBUG_PROBE_HPP
 
 #include <stdint.h>
+#include <type_traits>
 
 #define STRUCPP_DBG_ABI_VERSION 1u
 
@@ -110,10 +111,164 @@ void strucpp_dbg_frame_unlink(struct strucpp_dbg_frame* frame);
 // Bit 0 only, so the branch can test the bit directly (`ldrb; tbnz`).
 #define STRUCPP_DBG_ACTIVE_NOW() (*static_cast<volatile uint8_t*>(&strucpp_dbg_active) & STRUCPP_DBG_ACTIVE)
 
-/** Poll site `k`: with a session attached, leave by a tail return into the
- *  probed clone, which resumes at site `k`. */
-#define STRUCPP_POLL(k, ...) \
-    do { if (__builtin_expect(STRUCPP_DBG_ACTIVE_NOW() != 0, 0)) return __VA_ARGS__; } while (0)
+/** Poll site `k`: with a session attached, leave into the probed clone, which
+ *  resumes at site `k`.
+ *
+ *  STRUCPP_POLL(k, xfer)
+ *      returns `xfer` (a call of the probed clone): FB bodies and programs,
+ *      where GCC makes it a sibling call.
+ *  STRUCPP_POLL(k, xfer, n, stub, retp, ret, STRUCPP_XA(a) | STRUCPP_XP(a)...)
+ *      functions, methods and property accessors. A call returning in memory
+ *      or taking objects by value is never a sibling call, so `return xfer`
+ *      would give the unprobed clone a frame its probe-off build lacks. On
+ *      aarch64 the transfer is instead an asm block that saves every
+ *      register it touches on its own stack and calls `stub` with the
+ *      encoded state (slot 1: `retp`, slot 2: k, slots 3..n: the arguments,
+ *      STRUCPP_XP by address, STRUCPP_XA as XArg encodes them); the unprobed
+ *      clone then returns `ret`, which the stub has written through `retp`.
+ *      Elsewhere it is `return xfer`. A void POU passes `0, (void)0`. */
+#define STRUCPP_POLL(...) \
+    STRUCPP_DBG_CAT(STRUCPP_POLL_, STRUCPP_DBG_POLL_KIND(__VA_ARGS__))(__VA_ARGS__)
+#define STRUCPP_DBG_CAT_(a, b) a##b
+#define STRUCPP_DBG_CAT(a, b) STRUCPP_DBG_CAT_(a, b)
+#define STRUCPP_DBG_POLL_KIND(...) STRUCPP_DBG_ARG40(__VA_ARGS__, \
+    X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, T, E)
+#define STRUCPP_DBG_ARG40(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, \
+    _15, _16, _17, _18, _19, _20, _21, _22, _23, _24, _25, _26, _27, _28, _29, _30, _31, \
+    _32, _33, _34, _35, _36, _37, _38, _39, _40, kind, ...) kind
+#define STRUCPP_POLL_T(k, xfer) \
+    do { if (__builtin_expect(STRUCPP_DBG_ACTIVE_NOW() != 0, 0)) return xfer; } while (0)
+
+#if defined(__aarch64__) && defined(__GNUC__)
+#define STRUCPP_POLL_X(k, xfer, n, stub, retp, ret, ...) \
+    do { if (__builtin_expect(STRUCPP_DBG_ACTIVE_NOW() != 0, 0)) { \
+        STRUCPP_DBG_XCALL(n, stub, ::strucpp::dbg::xret_addr(retp), k, __VA_ARGS__); \
+        return ret; } } while (0)
+#define STRUCPP_XA(a) "r"(::strucpp::dbg::XArg<decltype(a)>::put(a))
+#define STRUCPP_XP(a) "r"(::strucpp::dbg::XAddr<decltype(a)>::put(a))
+// 928 bytes of own stack: state slots 0..31, then x0-x18, x30, q0-q31. No register
+// is clobbered and no call is visible, so the site needs no frame of its own.
+#define STRUCPP_DBG_XS(i) "str %" #i ", [sp, #" #i "*8]\n\t"
+#define STRUCPP_DBG_XCALL(n, stub, retp, k, ...) \
+    __asm__ volatile( \
+        "sub sp, sp, #928\n\t" \
+        "stp x0, x1, [sp, #256]\n\t" "stp x2, x3, [sp, #272]\n\t" "stp x4, x5, [sp, #288]\n\t" \
+        "stp x6, x7, [sp, #304]\n\t" "stp x8, x9, [sp, #320]\n\t" "stp x10, x11, [sp, #336]\n\t" \
+        "stp x12, x13, [sp, #352]\n\t" "stp x14, x15, [sp, #368]\n\t" "stp x16, x17, [sp, #384]\n\t" \
+        "stp x18, x30, [sp, #400]\n\t" \
+        "stp q0, q1, [sp, #416]\n\t" "stp q2, q3, [sp, #448]\n\t" "stp q4, q5, [sp, #480]\n\t" \
+        "stp q6, q7, [sp, #512]\n\t" "stp q8, q9, [sp, #544]\n\t" "stp q10, q11, [sp, #576]\n\t" \
+        "stp q12, q13, [sp, #608]\n\t" "stp q14, q15, [sp, #640]\n\t" "stp q16, q17, [sp, #672]\n\t" \
+        "stp q18, q19, [sp, #704]\n\t" "stp q20, q21, [sp, #736]\n\t" "stp q22, q23, [sp, #768]\n\t" \
+        "stp q24, q25, [sp, #800]\n\t" "stp q26, q27, [sp, #832]\n\t" "stp q28, q29, [sp, #864]\n\t" \
+        "stp q30, q31, [sp, #896]\n\t" \
+        STRUCPP_DBG_XS(0) STRUCPP_DBG_XST_##n \
+        "ldr x16, [sp]\n\t" \
+        "mov x0, sp\n\t" \
+        "blr x16\n\t" \
+        "ldp q0, q1, [sp, #416]\n\t" "ldp q2, q3, [sp, #448]\n\t" "ldp q4, q5, [sp, #480]\n\t" \
+        "ldp q6, q7, [sp, #512]\n\t" "ldp q8, q9, [sp, #544]\n\t" "ldp q10, q11, [sp, #576]\n\t" \
+        "ldp q12, q13, [sp, #608]\n\t" "ldp q14, q15, [sp, #640]\n\t" "ldp q16, q17, [sp, #672]\n\t" \
+        "ldp q18, q19, [sp, #704]\n\t" "ldp q20, q21, [sp, #736]\n\t" "ldp q22, q23, [sp, #768]\n\t" \
+        "ldp q24, q25, [sp, #800]\n\t" "ldp q26, q27, [sp, #832]\n\t" "ldp q28, q29, [sp, #864]\n\t" \
+        "ldp q30, q31, [sp, #896]\n\t" \
+        "ldp x0, x1, [sp, #256]\n\t" "ldp x2, x3, [sp, #272]\n\t" "ldp x4, x5, [sp, #288]\n\t" \
+        "ldp x6, x7, [sp, #304]\n\t" "ldp x8, x9, [sp, #320]\n\t" "ldp x10, x11, [sp, #336]\n\t" \
+        "ldp x12, x13, [sp, #352]\n\t" "ldp x14, x15, [sp, #368]\n\t" "ldp x16, x17, [sp, #384]\n\t" \
+        "ldp x18, x30, [sp, #400]\n\t" \
+        "add sp, sp, #928" \
+        : \
+        : "r"(reinterpret_cast<uint64_t>(&(stub))), "r"(retp), \
+          "r"(static_cast<uint64_t>(k)), __VA_ARGS__ \
+        : "memory", "cc")
+#define STRUCPP_DBG_XST_2 STRUCPP_DBG_XS(1) STRUCPP_DBG_XS(2)
+#define STRUCPP_DBG_XST_3 STRUCPP_DBG_XST_2 STRUCPP_DBG_XS(3)
+#define STRUCPP_DBG_XST_4 STRUCPP_DBG_XST_3 STRUCPP_DBG_XS(4)
+#define STRUCPP_DBG_XST_5 STRUCPP_DBG_XST_4 STRUCPP_DBG_XS(5)
+#define STRUCPP_DBG_XST_6 STRUCPP_DBG_XST_5 STRUCPP_DBG_XS(6)
+#define STRUCPP_DBG_XST_7 STRUCPP_DBG_XST_6 STRUCPP_DBG_XS(7)
+#define STRUCPP_DBG_XST_8 STRUCPP_DBG_XST_7 STRUCPP_DBG_XS(8)
+#define STRUCPP_DBG_XST_9 STRUCPP_DBG_XST_8 STRUCPP_DBG_XS(9)
+#define STRUCPP_DBG_XST_10 STRUCPP_DBG_XST_9 STRUCPP_DBG_XS(10)
+#define STRUCPP_DBG_XST_11 STRUCPP_DBG_XST_10 STRUCPP_DBG_XS(11)
+#define STRUCPP_DBG_XST_12 STRUCPP_DBG_XST_11 STRUCPP_DBG_XS(12)
+#define STRUCPP_DBG_XST_13 STRUCPP_DBG_XST_12 STRUCPP_DBG_XS(13)
+#define STRUCPP_DBG_XST_14 STRUCPP_DBG_XST_13 STRUCPP_DBG_XS(14)
+#define STRUCPP_DBG_XST_15 STRUCPP_DBG_XST_14 STRUCPP_DBG_XS(15)
+#define STRUCPP_DBG_XST_16 STRUCPP_DBG_XST_15 STRUCPP_DBG_XS(16)
+#define STRUCPP_DBG_XST_17 STRUCPP_DBG_XST_16 STRUCPP_DBG_XS(17)
+#define STRUCPP_DBG_XST_18 STRUCPP_DBG_XST_17 STRUCPP_DBG_XS(18)
+#define STRUCPP_DBG_XST_19 STRUCPP_DBG_XST_18 STRUCPP_DBG_XS(19)
+#define STRUCPP_DBG_XST_20 STRUCPP_DBG_XST_19 STRUCPP_DBG_XS(20)
+#define STRUCPP_DBG_XST_21 STRUCPP_DBG_XST_20 STRUCPP_DBG_XS(21)
+#define STRUCPP_DBG_XST_22 STRUCPP_DBG_XST_21 STRUCPP_DBG_XS(22)
+#define STRUCPP_DBG_XST_23 STRUCPP_DBG_XST_22 STRUCPP_DBG_XS(23)
+#define STRUCPP_DBG_XST_24 STRUCPP_DBG_XST_23 STRUCPP_DBG_XS(24)
+#define STRUCPP_DBG_XST_25 STRUCPP_DBG_XST_24 STRUCPP_DBG_XS(25)
+#define STRUCPP_DBG_XST_26 STRUCPP_DBG_XST_25 STRUCPP_DBG_XS(26)
+#define STRUCPP_DBG_XST_27 STRUCPP_DBG_XST_26 STRUCPP_DBG_XS(27)
+#define STRUCPP_DBG_XST_28 STRUCPP_DBG_XST_27 STRUCPP_DBG_XS(28)
+#define STRUCPP_DBG_XST_29 STRUCPP_DBG_XST_28 STRUCPP_DBG_XS(29)
+#else
+#define STRUCPP_POLL_X(k, xfer, ...) STRUCPP_POLL_T(k, xfer)
+#define STRUCPP_XA(a) a
+#define STRUCPP_XP(a) a
+#endif
+
+namespace strucpp {
+template <typename T> class IECVar;
+namespace dbg {
+
+/** Encoding of one transfer argument in a 64-bit state slot, keyed on its
+ *  declared type: an IECVar of an arithmetic type by value (its get(), as the
+ *  by-value copy would see it; no address taken, so a register local stays a
+ *  register), a pointer by value, anything else by address. */
+template <typename T, typename = void>
+struct XArg {
+    static uint64_t put(const T& v) noexcept { return reinterpret_cast<uintptr_t>(&v); }
+    static T get(uint64_t s) { return *reinterpret_cast<const T*>(static_cast<uintptr_t>(s)); }
+};
+template <typename T>
+struct XArg<T&, void> {
+    static uint64_t put(T& v) noexcept { return reinterpret_cast<uintptr_t>(&v); }
+    static T& get(uint64_t s) noexcept { return *reinterpret_cast<T*>(static_cast<uintptr_t>(s)); }
+};
+template <typename T>
+struct XArg<T*, void> {
+    static uint64_t put(T* p) noexcept { return reinterpret_cast<uintptr_t>(p); }
+    static T* get(uint64_t s) noexcept { return reinterpret_cast<T*>(static_cast<uintptr_t>(s)); }
+};
+template <typename T>
+struct XArg<IECVar<T>, typename std::enable_if<std::is_arithmetic<T>::value && sizeof(T) <= 8>::type> {
+    static uint64_t put(const IECVar<T>& v) noexcept {
+        T x = v.get();
+        uint64_t b = 0;
+        __builtin_memcpy(&b, &x, sizeof x);
+        return b;
+    }
+    static IECVar<T> get(uint64_t s) noexcept {
+        T x;
+        __builtin_memcpy(&x, &s, sizeof x);
+        return IECVar<T>(x);
+    }
+};
+
+/** By address whatever the type: parameters and the result, which are in
+ *  memory already, so the poll site loads nothing to encode them. */
+template <typename T>
+struct XAddr {
+    static uint64_t put(const T& v) noexcept { return reinterpret_cast<uintptr_t>(&v); }
+    static T get(uint64_t s) { return *reinterpret_cast<const T*>(static_cast<uintptr_t>(s)); }
+};
+template <typename T>
+struct XAddr<T&> : XArg<T&> {};
+
+template <typename T>
+inline uint64_t xret_addr(T* p) noexcept { return reinterpret_cast<uintptr_t>(p); }
+inline uint64_t xret_addr(int) noexcept { return 0; }
+
+}  // namespace dbg
+}  // namespace strucpp
 
 // ---------------------------------------------------------------- clones
 #if defined(__GNUC__) && !defined(__clang__)
