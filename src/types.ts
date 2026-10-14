@@ -234,8 +234,11 @@ export interface CompileResult {
   /** Compilation warnings */
   warnings: CompileError[];
 
-  /** Optional debug information */
-  debugInfo?: unknown;
+  /**
+   * Scope, type and instance description of this build. Serialise with
+   * `serializeDebugInfo()` to `debug-info.json`. See debug-info-gen.ts.
+   */
+  debugInfo?: import("./backend/debug-info-gen.js").DebugInfoV1;
 
   /** Parsed AST (only populated on successful compilation) */
   ast?: import("./frontend/ast.js").CompilationUnit;

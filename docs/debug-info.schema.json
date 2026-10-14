@@ -1,0 +1,216 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/Autonomy-Logic/STruCpp/docs/debug-info.schema.json",
+  "title": "STruC++ debug-info.json, major 1",
+  "description": "Statement, scope and type information for one build (ADR-002 D3). Every object permits additional properties: a minor version only adds fields, and readers ignore what they do not know (ADR-002 D2). Prose: docs/DEBUG_INFO.md.",
+  "type": "object",
+  "required": ["format", "major", "minor", "build", "files", "pous", "probes", "lines", "types", "instances", "globals", "externals", "origins", "formats"],
+  "properties": {
+    "format": { "const": "strucpp-debug-info" },
+    "major": { "const": 1 },
+    "minor": { "$ref": "#/definitions/count" },
+    "build": {
+      "type": "object",
+      "required": ["md5", "buildId", "compiler", "options", "probes"],
+      "properties": {
+        "md5": { "type": "string", "pattern": "^([0-9a-fA-F]{32})?$" },
+        "buildId": { "$ref": "#/definitions/sha256" },
+        "compiler": { "type": "string", "pattern": "^strucpp " },
+        "options": { "type": "object" },
+        "time": { "type": "string" },
+        "probes": { "type": "boolean" }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "path", "sha256", "library", "generated"],
+        "properties": {
+          "id": { "$ref": "#/definitions/count" },
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "$ref": "#/definitions/sha256" },
+          "library": { "type": ["string", "null"] },
+          "generated": { "type": "boolean" }
+        }
+      }
+    },
+    "pous": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "kind", "owner", "file", "span", "entryProbe", "noSource", "noSourceReason", "cppSymbol", "generated", "typeId", "locals"],
+        "properties": {
+          "id": { "$ref": "#/definitions/count" },
+          "name": { "type": "string", "minLength": 1 },
+          "kind": { "enum": ["program", "fb", "function", "method"] },
+          "owner": { "$ref": "#/definitions/idOrNull" },
+          "file": { "$ref": "#/definitions/idOrNull" },
+          "span": {
+            "oneOf": [
+              { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 4, "maxItems": 4 },
+              { "type": "null" }
+            ]
+          },
+          "entryProbe": { "$ref": "#/definitions/idOrNull" },
+          "noSource": { "type": "boolean" },
+          "noSourceReason": { "enum": ["library", "binary", "optout", null] },
+          "cppSymbol": { "type": ["string", "null"] },
+          "generated": { "type": "boolean" },
+          "typeId": { "$ref": "#/definitions/idOrNull" },
+          "locals": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "typeId", "kind", "localsSlot"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "typeId": { "$ref": "#/definitions/count" },
+                "kind": { "$ref": "#/definitions/section" },
+                "localsSlot": { "$ref": "#/definitions/idOrNull" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "probes": {
+      "type": "object",
+      "required": ["pou", "file", "line", "col", "endLine", "endCol", "kind", "flags", "origin"],
+      "properties": {
+        "pou": { "$ref": "#/definitions/countColumn" },
+        "file": { "$ref": "#/definitions/countColumn" },
+        "line": { "$ref": "#/definitions/countColumn" },
+        "col": { "$ref": "#/definitions/countColumn" },
+        "endLine": { "$ref": "#/definitions/countColumn" },
+        "endCol": { "$ref": "#/definitions/countColumn" },
+        "kind": { "type": "array", "items": { "enum": [0, 1, 2, 3] } },
+        "flags": { "$ref": "#/definitions/countColumn" },
+        "origin": { "type": "array", "items": { "type": "integer", "minimum": -1 } }
+      }
+    },
+    "lines": {
+      "type": "object",
+      "propertyNames": { "pattern": "^(0|[1-9][0-9]*)$" },
+      "additionalProperties": { "$ref": "#/definitions/countColumn" }
+    },
+    "types": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "name"],
+        "properties": {
+          "id": { "$ref": "#/definitions/count" },
+          "kind": { "enum": ["fb", "struct", "array", "enum", "string", "subrange", "union", "ref", "elementary"] },
+          "name": { "type": ["string", "null"] },
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "typeId", "section", "location", "format"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "typeId": { "$ref": "#/definitions/count" },
+                "section": { "oneOf": [{ "$ref": "#/definitions/section" }, { "type": "null" }] },
+                "location": { "type": ["string", "null"] },
+                "format": { "$ref": "#/definitions/idOrNull" }
+              }
+            }
+          },
+          "dims": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "oneOf": [
+                { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+                { "type": "null" }
+              ]
+            }
+          },
+          "elem": { "$ref": "#/definitions/count" },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": [{ "type": "string", "minLength": 1 }, { "type": "integer" }],
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "length": { "type": "integer", "minimum": 1 },
+          "wide": { "type": "boolean" },
+          "base": { "$ref": "#/definitions/idOrNull" },
+          "range": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+          "target": { "$ref": "#/definitions/idOrNull" },
+          "refKind": { "enum": ["ref_to", "reference_to", "pointer_to", "interface"] },
+          "extends": { "$ref": "#/definitions/idOrNull" },
+          "opaque": { "type": "boolean" }
+        },
+        "allOf": [
+          { "if": { "properties": { "kind": { "enum": ["fb", "struct", "union"] } } }, "then": { "required": ["members"] } },
+          { "if": { "properties": { "kind": { "const": "array" } } }, "then": { "required": ["dims", "elem"] } },
+          { "if": { "properties": { "kind": { "const": "enum" } } }, "then": { "required": ["values"] } },
+          { "if": { "properties": { "kind": { "const": "string" } } }, "then": { "required": ["length", "wide"] } },
+          { "if": { "properties": { "kind": { "const": "subrange" } } }, "then": { "required": ["base", "range"] } },
+          { "if": { "properties": { "kind": { "const": "ref" } } }, "then": { "required": ["target"] } },
+          { "if": { "properties": { "kind": { "const": "elementary" } } }, "then": { "properties": { "name": { "type": "string" } } } }
+        ]
+      }
+    },
+    "instances": {
+      "type": "object",
+      "required": ["path", "typeId", "leafBase", "leafBaseExt"],
+      "properties": {
+        "path": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "typeId": { "$ref": "#/definitions/countColumn" },
+        "leafBase": { "type": "array", "items": { "$ref": "#/definitions/idOrNull" } },
+        "leafBaseExt": { "type": "array", "items": { "$ref": "#/definitions/idOrNull" } }
+      }
+    },
+    "globals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "typeId", "location", "leafBase"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "typeId": { "$ref": "#/definitions/count" },
+          "location": { "type": ["string", "null"] },
+          "leafBase": { "$ref": "#/definitions/idOrNull" }
+        }
+      }
+    },
+    "externals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pou", "name", "global"],
+        "properties": {
+          "pou": { "$ref": "#/definitions/count" },
+          "name": { "type": "string", "minLength": 1 },
+          "global": { "$ref": "#/definitions/idOrNull" }
+        }
+      }
+    },
+    "origins": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pou", "kind", "id"],
+        "properties": {
+          "pou": { "type": "string" },
+          "kind": { "enum": ["rung", "element", "block"] },
+          "id": { "type": "string" }
+        }
+      }
+    },
+    "formats": { "type": "array" }
+  },
+  "definitions": {
+    "count": { "type": "integer", "minimum": 0 },
+    "idOrNull": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+    "countColumn": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "section": { "enum": ["VAR", "VAR_INPUT", "VAR_OUTPUT", "VAR_IN_OUT", "VAR_TEMP", "VAR_EXTERNAL", "VAR_GLOBAL", "VAR_INST"] }
+  }
+}
