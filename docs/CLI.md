@@ -130,6 +130,8 @@ Format is auto-detected. Extracts ST source from the binary/ZIP format, compiles
 | `--source-comments`   | Include ST source as C++ comments                       |
 | `--no-line-mapping`   | Disable ST-to-C++ line mapping                          |
 | `-O <level>`          | Optimization level: 0, 1, or 2 (default: 0)             |
+| `--no-probes`         | Compile without debugger probes (see RUNTIME.md)        |
+| `--probe-leaf-rule`   | No entry poll in leaf functions and FBs (off: default)  |
 
 ### Libraries
 

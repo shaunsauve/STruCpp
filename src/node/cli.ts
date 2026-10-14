@@ -14,6 +14,10 @@
  *   --no-line-mapping         Disable line mapping
  *   --line-directives         Include #line directives
  *   --source-comments         Include ST source as comments
+  --no-probes               Compile without debugger probes (watch and force still work)
+  --probe-leaf-rule         No entry poll in leaf functions and FBs (off by default)
+ *   --no-probes               Compile without debugger probes
+ *   --probe-leaf-rule         No entry poll in leaf functions / FBs
  *   -O, --optimize <level>    Optimization level (0, 1, 2)
  *   --build                   Compile to executable binary with interactive REPL
  *   --gpp <path>              Custom g++ path (default: g++)
@@ -86,6 +90,8 @@ interface CLIOptions {
   libVersion: string;
   libNamespace?: string;
   noSource: boolean;
+  noProbes: boolean;
+  probeLeafRule: boolean;
   builtin: boolean;
   decompileLib?: string;
   importLib?: string;
@@ -154,6 +160,8 @@ function parseArgs(args: string[]): CLIOptions {
     compileLib: false,
     libVersion: "1.0.0",
     noSource: false,
+    noProbes: false,
+    probeLeafRule: false,
     builtin: false,
     test: [],
     defines: {},
@@ -235,6 +243,10 @@ function parseArgs(args: string[]): CLIOptions {
       if (nextArg !== undefined) {
         options.libNamespace = nextArg;
       }
+    } else if (arg === "--no-probes") {
+      options.noProbes = true;
+    } else if (arg === "--probe-leaf-rule") {
+      options.probeLeafRule = true;
     } else if (arg === "--no-source") {
       options.noSource = true;
     } else if (arg === "--builtin") {
@@ -630,6 +642,8 @@ function runTestMode(options: CLIOptions): void {
     headerFileName: "generated.hpp",
     fileName: basename(inputPath),
     isTestBuild: true,
+    debugProbes: !options.noProbes,
+    debugProbeLeafRule: options.probeLeafRule,
   };
   if (additionalSources.length > 0) {
     compileOptions.additionalSources = additionalSources;
@@ -1041,6 +1055,8 @@ async function main(): Promise<void> {
     optimizationLevel: options.optimizationLevel,
     headerFileName,
     fileName: basename(inputPath),
+    debugProbes: !options.noProbes,
+    debugProbeLeafRule: options.probeLeafRule,
   };
   if (additionalSources.length > 0) {
     compileOptions.additionalSources = additionalSources;

@@ -232,6 +232,35 @@ Template implementations of all IEC 61131-3 standard functions:
 
 Variadic functions (ADD, MUL, MIN, MAX) accept 2+ arguments via template parameter packs.
 
+## Debugger Probes (`debug_probe.hpp`)
+
+By default every POU body is emitted twice. The **unprobed clone** is exactly the
+`--no-probes` code plus a *poll* at POU entry, at each loop back-edge and after each
+statement that calls a POU: one byte load of `strucpp_dbg_active` and one test-and-branch
+(`ldrb; tbnz` on arm64). With no debug session that is all the debugger costs. When a host
+attaches (sets bit 0), the next poll leaves by a tail return into the **probed clone**
+(`__dbg_probed`), which resumes at the same point with the same stack locals (passed by
+value) and runs a probe before every statement and loop / `ELSIF` condition, plus a frame
+record. Probe IDs are those of `debug-info.json`.
+
+The program defines the flag bytes (`strucpp_dbg_flags[]`, `ARMED` / `TRAP` bits), the
+active byte, `strucpp_dbg_probe_count()`, `strucpp_dbg_abi_version()` and
+`strucpp_dbg_lock_depth()`. The host defines `strucpp_dbg_hit()` (a probe's slow path; it
+must not park while `strucpp_dbg_lock_depth() > 0`) and `strucpp_dbg_frame_link()` /
+`_unlink()`. Probe builds carry weak no-op versions of the host functions so they link
+without a host; `runtime/test/debug_probe_stub.hpp` is a host for tests.
+
+Under `STRUCPP_THREADED`, `GlobalVar::read`, `write` and `with_lock` count the calling
+thread's shared-global lock depth. Codegen evaluates subscripts and `=>` capture sources
+before taking a global's lock, so no user code runs under one except a property getter
+read through a shared global (refused when the getter's FB declares a `VAR_EXTERNAL`).
+
+`--no-probes` emits none of this: no polls, clones, flags or lock-depth counter, and
+`strucpp_dbg_probe_count()` returns 0. Watch and force work as before through
+`generated_debug.cpp`. `--probe-leaf-rule` drops the entry poll of leaf functions and FBs
+(no POU call, no loop, at most 32 statements); probed callers enter their probed clone
+directly.
+
 ## REPL Runtime (`runtime/repl/`)
 
 The interactive REPL binary uses [isocline](https://github.com/daanx/isocline) (MIT licensed) for line editing with syntax highlighting, tab completion, and command history. `iec_repl.hpp` provides the STruC++ REPL harness that wraps compiled programs with an interactive shell for variable inspection, function invocation, and time advancement for FB testing.
@@ -258,5 +287,6 @@ The interactive REPL binary uses [isocline](https://github.com/daanx/isocline) (
 | `iec_pointer.hpp` | POINTER TO type |
 | `iec_ptr.hpp` | REF_TO, REFERENCE_TO, and ADR support |
 | `iec_retain.hpp` | RETAIN variable tracking |
+| `debug_probe.hpp` | Debugger probes, polls, frames and their C ABI |
 | `iec_memory.hpp` | Dynamic allocation (__NEW/__DELETE) |
 | `iec_std_lib.hpp` | Standard function implementations |
