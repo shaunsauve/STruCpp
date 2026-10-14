@@ -252,6 +252,8 @@ export interface RunE2ETestPipelineOptions {
   tempDirPrefix?: string;
   /** Additional compile options passed to compile() */
   compileOptions?: Record<string, unknown>;
+  /** Extra environment for the test binary (e.g. the debug probe stub's mode). */
+  env?: Record<string, string>;
 }
 
 /**
@@ -346,6 +348,7 @@ export function runE2ETestPipeline(
       const stdout = execSync(`"${binaryPath}"`, {
         encoding: 'utf-8',
         timeout: 10000,
+        ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
       });
       return { stdout, exitCode: 0 };
     } catch (err: unknown) {
