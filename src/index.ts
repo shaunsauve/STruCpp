@@ -107,22 +107,100 @@ function validateCompileOptions(options: CompileOptions): void {
  * declared reachable so the test harness sees the full symbol set
  * regardless of what the source AST happens to reference.
  */
+/** A user declaration that claims a top-level name (upper-cased). */
+interface UserDeclaredName {
+  /** IEC keyword of the declaration: `FUNCTION_BLOCK`, `TYPE`, ... */
+  keyword: string;
+  name: string;
+  sourceSpan: { file: string; startLine: number; startCol: number };
+}
+
+/**
+ * Top-level names the user's own source declares. They shadow a library POU
+ * or type of the same name, as a project POU shadows a library one in
+ * CODESYS: the analyzer already resolves the name to the user's declaration
+ * (`defineOrReplace`), so the tree-shake must not also link the library's.
+ */
+function userDeclaredNames(
+  ast: CompilationUnit,
+): Map<string, UserDeclaredName> {
+  const names = new Map<string, UserDeclaredName>();
+  const add = (
+    keyword: string,
+    d: { name: string; sourceSpan: UserDeclaredName["sourceSpan"] },
+  ): void => {
+    const key = d.name.toUpperCase();
+    if (!names.has(key)) {
+      names.set(key, { keyword, name: d.name, sourceSpan: d.sourceSpan });
+    }
+  };
+  for (const d of ast.programs) add("PROGRAM", d);
+  for (const d of ast.functionBlocks) add("FUNCTION_BLOCK", d);
+  for (const d of ast.functions) add("FUNCTION", d);
+  for (const d of ast.interfaces) add("INTERFACE", d);
+  for (const d of ast.types) add("TYPE", d);
+  return names;
+}
+
+/** A linked library chunk needs a library symbol that a user declaration shadows. */
+interface LibraryShadowConflict {
+  user: UserDeclaredName;
+  library: string;
+  /** The library chunk that depends on the shadowed name. */
+  usedBy: string;
+}
+
+function shadowConflictMessage(c: LibraryShadowConflict): string {
+  const at = `${c.user.sourceSpan.file}:${c.user.sourceSpan.startLine}`;
+  const upper = c.user.name.toUpperCase();
+  return (
+    `${c.user.keyword} ${c.user.name} (${at}) has the name of library POU ` +
+    `${upper} (${c.library}), which library POU ${c.usedBy} is built on. ` +
+    `A user declaration shadows a library POU only where no library POU in ` +
+    `use needs it: rename ${c.user.name}.`
+  );
+}
+
 function collectUsedSymbols(
   ast: CompilationUnit,
   archives: StlibArchive[],
   includeEverything: boolean,
-): Map<string, Set<string>> {
-  // When asked to include everything (test builds), short-circuit.
+  shadowed: Map<string, UserDeclaredName> = userDeclaredNames(ast),
+): {
+  byLibrary: Map<string, Set<string>>;
+  conflicts: LibraryShadowConflict[];
+} {
+  // When asked to include everything (test builds), short-circuit: every chunk
+  // except a shadowed one and those built on it, which nothing here asked for.
   if (includeEverything) {
+    const dropped = new Set<string>();
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const archive of archives) {
+        for (const chunk of archive.chunks ?? []) {
+          const key = `${archive.manifest.name}:${chunk.name}`;
+          if (dropped.has(key)) continue;
+          if (
+            shadowed.has(chunk.name.toUpperCase()) ||
+            chunk.deps.some((d) => dropped.has(`${d.library}:${d.name}`))
+          ) {
+            dropped.add(key);
+            changed = true;
+          }
+        }
+      }
+    }
     const all = new Map<string, Set<string>>();
     for (const archive of archives) {
       const chunkNames = new Set<string>();
       for (const chunk of archive.chunks ?? []) {
-        chunkNames.add(chunk.name);
+        if (!dropped.has(`${archive.manifest.name}:${chunk.name}`)) {
+          chunkNames.add(chunk.name);
+        }
       }
       all.set(archive.manifest.name, chunkNames);
     }
-    return all;
+    return { byLibrary: all, conflicts: [] };
   }
 
   // Build symbol→{library, chunk} index across every archive.  Names
@@ -194,6 +272,8 @@ function collectUsedSymbols(
   const queue: Array<{ library: string; chunk: string }> = [];
 
   for (const name of referencedNames) {
+    // A name the user declares refers to the user's declaration.
+    if (shadowed.has(name)) continue;
     const entry = symbolIndex.get(name);
     if (entry) {
       const key = `${entry.library}:${entry.chunk}`;
@@ -222,12 +302,20 @@ function collectUsedSymbols(
     }
   }
 
+  const conflicts: LibraryShadowConflict[] = [];
   while (queue.length > 0) {
     const cur = queue.shift()!;
     const lookup = chunkLookup.get(`${cur.library}:${cur.chunk}`);
     if (!lookup) continue;
     for (const dep of lookup.chunk.deps) {
       const depKey = `${dep.library}:${dep.name}`;
+      // The library's C++ names its dependency unqualified, so linking the
+      // user's same-named declaration in its place would rebind it silently.
+      const user = shadowed.get(dep.name.toUpperCase());
+      if (user && chunkByKey.has(depKey)) {
+        conflicts.push({ user, library: dep.library, usedBy: cur.chunk });
+        continue;
+      }
       if (reachable.has(depKey)) continue;
       const target = chunkByKey.get(depKey);
       if (!target) continue;
@@ -250,7 +338,7 @@ function collectUsedSymbols(
     set.add(name);
   }
 
-  return byLibrary;
+  return { byLibrary, conflicts };
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +353,8 @@ interface PipelineResult {
   warnings: CompileError[];
   allArchives: StlibArchive[];
   mergedOptions: CompileOptions;
+  /** Reachable chunk names per library (collectUsedSymbols); absent with no AST or library. */
+  libraryChunks?: Map<string, Set<string>>;
 }
 
 /**
@@ -699,6 +789,32 @@ function runPipeline(
     // In analyze mode, semantic failure is non-fatal — return whatever we have
   }
 
+  // Library linking: which chunks the user's AST reaches, with user
+  // declarations shadowing library ones. Here rather than in compile() so
+  // analyze() reports a shadowing conflict too.
+  let libraryChunks: Map<string, Set<string>> | undefined;
+  if (ast && allArchives.length > 0) {
+    const shake = collectUsedSymbols(
+      ast,
+      allArchives,
+      mergedOptions.isTestBuild ?? false,
+    );
+    libraryChunks = shake.byLibrary;
+    const seen = new Set<string>();
+    for (const c of shake.conflicts) {
+      const key = `${c.user.name.toUpperCase()}:${c.usedBy}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      errors.push({
+        message: shadowConflictMessage(c),
+        line: c.user.sourceSpan.startLine,
+        column: c.user.sourceSpan.startCol,
+        severity: "error",
+        file: c.user.sourceSpan.file,
+      });
+    }
+  }
+
   // Annotate errors/warnings with POU + section context so programmatic
   // consumers (e.g. the OpenPLC Editor) can route diagnostics to the
   // right POU tab and remap body-line numbers to the user's view.
@@ -717,6 +833,7 @@ function runPipeline(
     warnings,
     allArchives,
     mergedOptions,
+    ...(libraryChunks ? { libraryChunks } : {}),
   };
 }
 
@@ -807,12 +924,8 @@ export function compile(
   // edges), then hand the reachable subset of each archive to the
   // codegen for emission. Test builds bypass the shake — the test
   // harness may reference symbols not present in the source AST.
-  const isTestBuild = pipeline.mergedOptions.isTestBuild ?? false;
-  const reachableByArchive = collectUsedSymbols(
-    pipeline.ast,
-    pipeline.allArchives,
-    isTestBuild,
-  );
+  const reachableByArchive =
+    pipeline.libraryChunks ?? new Map<string, Set<string>>();
 
   for (const archive of pipeline.allArchives) {
     const reachable = reachableByArchive.get(archive.manifest.name);

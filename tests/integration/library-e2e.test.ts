@@ -283,6 +283,89 @@ int main() {
     expect(stdout).toBe("6");
   });
 
+  // NO-FOLD: library scoping. A user POU named like a library POU shadows it
+  // (normal and include-everything test builds); one a used library POU needs
+  // is refused with both named.
+  it("a user FB named PID shadows the library PID; shadowing one a library POU needs is an error naming both", () => {
+    const libraries = discoverStlibs(LIBS_DIR);
+    const userPid = `
+      FUNCTION_BLOCK PID
+        VAR_INPUT sp : REAL; END_VAR
+        VAR_OUTPUT y : REAL; END_VAR
+        y := sp * 2.0;
+      END_FUNCTION_BLOCK
+      PROGRAM Main
+        VAR c : PID; o : REAL; t : TON; END_VAR
+        c(sp := 1.5);
+        o := c.y;
+        t(IN := TRUE, PT := T#1s);
+      END_PROGRAM
+    `;
+    const result = compile(userPid, { libraries });
+    expect(result.errors.map((e) => e.message)).toEqual([]);
+    expect(result.linkedPous?.filter((p) => p.name === "PID")).toEqual([
+      { name: "PID", kind: "fb", library: null },
+    ]);
+    const stdout = compileAndRunStandalone({
+      tempDir,
+      pchPath,
+      headerCode: result.headerCode,
+      cppCode: result.cppCode,
+      testName: "lib_e2e_user_pid",
+      mainCode: `
+#include "generated.hpp"
+#include <iostream>
+int main() {
+    strucpp::Program_MAIN prog;
+    prog.run();
+    std::cout << static_cast<double>(prog.O) << std::endl;
+    return 0;
+}
+`,
+    });
+    expect(stdout).toBe("3");
+
+    const { stdout: testOut, exitCode } = runE2ETestPipeline({
+      sourceST: userPid,
+      testST: `
+TEST 'user PID shadows the library PID'
+  VAR uut : Main; END_VAR
+  uut();
+  ASSERT_EQ(uut.o, 3.0);
+END_TEST
+      `,
+      testFileName: "test_user_pid.st",
+      isTestBuild: true,
+      tempDirPrefix: "strucpp-lib-e2e-user-pid-",
+      compileOptions: { libraries },
+    });
+    expect(testOut).not.toContain("[FAIL]");
+    expect(exitCode).toBe(0);
+
+    // The library's PID is built on its own INTEGRAL: a user INTEGRAL cannot
+    // stand in for it, so using the library PID is refused, naming both.
+    const clash = compile(
+      `
+      FUNCTION_BLOCK INTEGRAL
+        VAR_OUTPUT q : INT; END_VAR
+        q := 1;
+      END_FUNCTION_BLOCK
+      PROGRAM Main
+        VAR p : PID; END_VAR
+        p(AUTO := TRUE);
+      END_PROGRAM
+    `,
+      { libraries, fileName: "main.st" },
+    );
+    expect(clash.success).toBe(false);
+    expect(clash.errors.map((e) => e.message)).toEqual([
+      expect.stringMatching(
+        /FUNCTION_BLOCK INTEGRAL .*main\.st:2.* library POU INTEGRAL \(additional-function-blocks\).*PID/,
+      ),
+    ]);
+    expect(clash.errors[0]!.line).toBe(2);
+  });
+
   it("bundled stdlib works via libraryPaths", () => {
     const sourceST = `
       PROGRAM TestCTU

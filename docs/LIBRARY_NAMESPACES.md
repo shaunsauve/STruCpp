@@ -17,6 +17,16 @@ behavior, and the architectural changes required.
   `INIT`), the second registration is **silently dropped** — first-loaded wins,
   no warning, no error.
 - User code cannot write `LibName.TypeName` to disambiguate library types.
+- A user POU, type or interface named like a library one **shadows** it, as a
+  project POU shadows a library POU in CODESYS: the analyzer resolves the name
+  to the user's declaration, and the tree-shake does not link the library's
+  (`collectUsedSymbols` in `src/index.ts`). A library POU in use that is built
+  on the shadowed name cannot be linked, since its C++ names the dependency
+  unqualified and would bind to the user's class; that is a compile error
+  naming both (`FUNCTION_BLOCK INTEGRAL (main.st:2) has the name of library
+  POU INTEGRAL (additional-function-blocks), which library POU PID is built
+  on`). Test builds, which link every chunk, drop the shadowed chunk and the
+  chunks built on it instead.
 
 ## CODESYS Target Behavior
 

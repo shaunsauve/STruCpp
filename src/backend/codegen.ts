@@ -1176,12 +1176,10 @@ export class CodeGenerator {
           }
         }
       }
-      if (inputNames.length > 0) {
-        this.fbInputParams.set(fb.name.toUpperCase(), inputNames);
-      }
-      if (inoutNames.length > 0) {
-        this.fbInoutParams.set(fb.name.toUpperCase(), new Set(inoutNames));
-      }
+      // Set even when empty: a user FB shadows a library FB of the same
+      // name, whose parameter lists registerLibraryArchives() put here first.
+      this.fbInputParams.set(fb.name.toUpperCase(), inputNames);
+      this.fbInoutParams.set(fb.name.toUpperCase(), new Set(inoutNames));
     }
 
     // Build set of known interface types, method name map, and per-interface method sets
