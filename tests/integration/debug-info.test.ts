@@ -45,12 +45,28 @@ if (!corpusPresent && CORPUS_ENV === undefined) {
 /** Corpus programs STruCpp cannot compile yet, with the reason. */
 const EXPECTED_FAIL: Record<string, string> = {
   "generated-region": "the {strucpp generated} pragmas are not lexed yet",
-  "iec-display": "a variable named `by` is lexed as the BY keyword",
-  "multi-task":
-    "codegen refuses a shared function-block global called from a program",
-  "retain-vars": "a PROGRAM named `Retain` is lexed as the RETAIN keyword",
   "rich-types": "UNION types are not parsed",
 };
+
+/** A corpus `reject-*.st` must be refused, with a diagnostic naming its
+ *  `expect-diagnostic:` header text when it has one (as build_all.sh checks). */
+function rejectFiles(
+  name: string,
+): Array<{ file: string; source: string; expect: string }> {
+  const dir = path.join(CORPUS_DIR, name);
+  return fs
+    .readdirSync(dir)
+    .filter((f) => /^reject-.*\.st$/.test(f))
+    .sort()
+    .map((file) => {
+      const source = fs.readFileSync(path.join(dir, file), "utf8");
+      return {
+        file,
+        source,
+        expect: headerValue(source, "expect-diagnostic") ?? "",
+      };
+    });
+}
 
 const schema: unknown = JSON.parse(fs.readFileSync(SCHEMA_PATH, "utf8"));
 const ajv = new Ajv({ allErrors: true });
@@ -175,6 +191,23 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
     });
 
     it.each(corpusNames)("%s", (name) => {
+      for (const r of rejectFiles(name)) {
+        let refusal: string;
+        try {
+          const res = compile(r.source, {
+            fileName: r.file,
+            libraries: corpusLibraries(path.join(CORPUS_DIR, name), name),
+          });
+          expect(
+            res.success,
+            `${name}/${r.file} compiled; it must be refused`,
+          ).toBe(false);
+          refusal = res.errors.map((e) => e.message).join("\n");
+        } catch (e) {
+          refusal = String(e);
+        }
+        expect(refusal, `${name}/${r.file}: refusal`).toContain(r.expect);
+      }
       const builds = corpusBuilds(name);
       const reason = EXPECTED_FAIL[name];
       if (reason !== undefined) {
