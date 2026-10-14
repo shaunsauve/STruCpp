@@ -132,6 +132,8 @@ Format is auto-detected. Extracts ST source from the binary/ZIP format, compiles
 | `-O <level>`          | Optimization level: 0, 1, or 2 (default: 0)             |
 | `--no-probes`         | Compile without debugger probes (see RUNTIME.md)        |
 | `--probe-leaf-rule`   | No entry poll in leaf functions and FBs (off: default)  |
+| `--debug-artifacts <dir>` | Write `generated_debug.cpp`, `debug-map.json`, `debug-info.json` and `defines.h` (see DEBUG_INFO.md) |
+| `--md5 <hex>`         | Program MD5 for debug info and `defines.h` (default: MD5 over the inputs in order) |
 
 ### Libraries
 

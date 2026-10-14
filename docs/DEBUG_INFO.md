@@ -28,6 +28,22 @@ are written. IEC identifiers are case-insensitive, so a reader compares them tha
 `UNSUPPORTED_DEBUG_INFO`, `details: {found, supported}` (`found` is `null` when there is no
 integer major), and accepts any `minor`.
 
+## The file set
+
+`emitDebugArtifacts(result)` returns the four files every build path writes, so the same inputs
+and options give byte-identical files from `compile()`, `strucpp --debug-artifacts <dir>` and the
+editor:
+
+| File | Bytes |
+|---|---|
+| `generated_debug.cpp` | `result.debugTableCpp`. |
+| `debug-map.json` | `JSON.stringify(debugMap, null, 2)`, no trailing newline: the editor's serialisation, unchanged. |
+| `debug-info.json` | `serializeDebugInfo(debugInfo)`: sorted keys, no whitespace. |
+| `defines.h` | `#pragma once`, `// Program MD5` and `#define PROGRAM_MD5 "<md5>"`, each ending in a newline. |
+
+The CLI's `--md5 <hex>` passes the program md5 the editor computes over `program.st` when the
+sources given are the editor's per-POU files.
+
 ## Build binding
 
 Three artefacts of one build carry the same `buildId`:
@@ -68,7 +84,9 @@ One entry per user source file, in compile order. `id` is the index other tables
 ## `pous`
 
 One entry per program, function block, function and method of the user source, then one per
-library function block that the program instantiates (with no source). Each property accessor is
+library function and function block linked into the build (`CompileResult.linkedPous`), with
+`noSource: true`, `noSourceReason: "library"` and no probes; a library function's parameters are
+its `locals`. Every linked POU appears. Each property accessor is
 a body of its own and is listed as a `method` of its function block named `<property>.GET` or
 `<property>.SET` (`P.GET`); its `span` is the `GET ... END_GET` or `SET ... END_SET` block.
 

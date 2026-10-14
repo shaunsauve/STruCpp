@@ -15,7 +15,11 @@ import Ajv from "ajv";
 import * as fs from "fs";
 import * as path from "path";
 import { createHash } from "crypto";
-import { compile } from "../../src/index.js";
+import { execFileSync } from "child_process";
+import * as os from "os";
+import { compile, emitDebugArtifacts } from "../../src/index.js";
+import * as vendoredSplit from "../fixtures/openplc-editor/split-program-st.js";
+import { editorBuild } from "../fixtures/openplc-editor/program-build.js";
 import { compileStlib } from "../../src/library/library-compiler.js";
 import { discoverStlibs } from "../../src/node/library-loader.js";
 import {
@@ -145,6 +149,7 @@ interface CorpusBuild {
   sources: Array<{ fileName: string; source: string }>;
   lineMap?: Map<number, LineMapEntry>;
   warnings?: string[];
+  linkedPous?: Array<{ name: string; kind: string; library: string | null }>;
 }
 
 const buildCache = new Map<string, CorpusBuild[]>();
@@ -196,6 +201,7 @@ function buildCorpus(name: string): CorpusBuild[] {
         sources,
         lineMap: r.lineMap,
         warnings: r.warnings.map((w) => w.message),
+        ...(r.linkedPous ? { linkedPous: r.linkedPous } : {}),
         ...(r.debugInfo ? { info: r.debugInfo } : {}),
         ...(r.debugMap ? { map: r.debugMap } : {}),
       };
@@ -251,6 +257,24 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
         expect(b.error, b.label).toBeUndefined();
         expect(b.info, `${b.label}: no debugInfo`).toBeDefined();
         expect(schemaErrors(serializeDebugInfo(b.info!)), b.label).toEqual([]);
+        // A020: every linked POU is described, with statements or as no-source.
+        expect(b.linkedPous, `${b.label}: no linkedPous`).toBeDefined();
+        const missing = b.linkedPous!.filter((l) => {
+          const pou = b.info!.pous.find(
+            (p) => p.name === l.name && p.kind === l.kind && p.owner === null,
+          );
+          return (
+            pou === undefined ||
+            (pou.noSource ? pou.noSourceReason === null : pou.file === null)
+          );
+        });
+        expect(missing, `${b.label}: linked POUs missing from pous[]`).toEqual([]);
+        for (const p of b.info!.pous.filter((x) => x.noSource)) {
+          expect(
+            b.info!.probes.pou.includes(p.id),
+            `${b.label}: no-source ${p.name} has probes`,
+          ).toBe(false);
+        }
         // A023: the extended map, serialised as the editor writes it, still
         // loads in today's editor and resolves every leaf.
         for (const editor of editorLoaders) {
@@ -1044,10 +1068,7 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
         for (const o of oracles)
           bad.push(...oracleDisagreements(name, o, builds));
       }
-      // TODO: library functions are not listed in pous[] yet (A020).
-      expect(
-        bad.filter((b) => !b.startsWith("library-pou/pou-inventory.oracle.json POU Twice")),
-      ).toEqual([]);
+      expect(bad).toEqual([]);
     });
   },
 );
@@ -1237,3 +1258,103 @@ describe("debug-info.json: generated-code pragmas (A026)", () => {
     ]);
   });
 });
+
+const LIVE_EDITOR_SPLIT = path.join(
+  EDITOR_DIR,
+  "src/backend/shared/utils/PLC/split-program-st.ts",
+);
+const splitters: Array<{ label: string; split: typeof vendoredSplit.splitProgramSt }> = [
+  { label: "vendored editor splitter", split: vendoredSplit.splitProgramSt },
+];
+if (fs.existsSync(LIVE_EDITOR_SPLIT)) {
+  splitters.push({
+    label: `editor splitter at ${LIVE_EDITOR_SPLIT}`,
+    split: ((await import(LIVE_EDITOR_SPLIT)) as typeof vendoredSplit).splitProgramSt,
+  });
+}
+
+const CLI_PATH = path.join(ROOT, "dist/node/cli.js");
+const ARTEFACTS = [
+  "generated_debug.cpp",
+  "debug-map.json",
+  "debug-info.json",
+  "defines.h",
+] as const;
+
+describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
+  "debug artefacts are byte-identical from the editor path, compile() and the CLI (A025)",
+  () => {
+    const sha = (text: string): string =>
+      createHash("sha256").update(text).digest("hex");
+    const hashes = (files: Record<string, string>): Record<string, string> =>
+      Object.fromEntries(Object.entries(files).map(([k, v]) => [k, sha(v)]));
+
+    it.each(["nested-fb-loop", "print-builtin"])("%s", (name) => {
+      const programSt = fs.readFileSync(
+        path.join(CORPUS_DIR, name, "program.st"),
+        "utf8",
+      );
+      for (const { label, split } of splitters) {
+        // Editor path: today's files, then debug-info.json through the shared emitter.
+        const ed = editorBuild(programSt, stdLibs, compile, split);
+        expect(ed.sources.length, `${label}: split`).toBeGreaterThan(1);
+        const edArtefacts = emitDebugArtifacts(ed.result);
+        for (const f of ["generated_debug.cpp", "debug-map.json", "defines.h"]) {
+          expect(edArtefacts[f as (typeof ARTEFACTS)[number]], `${label} ${f}: today's editor bytes`).toBe(
+            ed.files[f],
+          );
+        }
+        const edProbeCode = ed.result.cppFiles.map((f) => f.content).join("\n");
+
+        // Library path: compile() with the same inputs and options.
+        const [first, ...rest] = ed.sources;
+        const lib = compile(first!.source, {
+          headerFileName: "generated.hpp",
+          fileName: first!.fileName,
+          additionalSources: rest,
+          libraries: stdLibs,
+          debug: true,
+          md5: ed.md5,
+        });
+        expect(lib.errors).toEqual([]);
+
+        // CLI path: the same files and options through --debug-artifacts.
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "strucpp-parity-"));
+        try {
+          for (const s of ed.sources) {
+            fs.writeFileSync(path.join(dir, s.fileName), s.source);
+          }
+          execFileSync(
+            "node",
+            [
+              CLI_PATH,
+              ...ed.sources.map((s) => path.join(dir, s.fileName)),
+              "-o",
+              path.join(dir, "generated.cpp"),
+              "-d",
+              "--md5",
+              ed.md5,
+              "--debug-artifacts",
+              path.join(dir, "debug"),
+            ],
+            { encoding: "utf8" },
+          );
+          const cli = Object.fromEntries(
+            ARTEFACTS.map((f) => [
+              f,
+              fs.readFileSync(path.join(dir, "debug", f), "utf8"),
+            ]),
+          );
+          const want = hashes({ ...edArtefacts });
+          expect(hashes({ ...emitDebugArtifacts(lib) }), `${label}: compile()`).toEqual(want);
+          expect(hashes(cli), `${label}: CLI`).toEqual(want);
+          const cliProbeCode = fs.readFileSync(path.join(dir, "generated.cpp"), "utf8");
+          expect(sha(lib.cppCode), `${label}: compile() probe code`).toBe(sha(edProbeCode));
+          expect(sha(cliProbeCode), `${label}: CLI probe code`).toBe(sha(edProbeCode));
+        } finally {
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    });
+  },
+);

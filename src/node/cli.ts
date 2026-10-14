@@ -44,7 +44,13 @@ import {
 import { resolve, basename, dirname, join, relative, sep } from "path";
 import { tmpdir, platform } from "os";
 import { execFileSync } from "child_process";
-import { compile, getVersion, compileStlib } from "../index.js";
+import {
+  compile,
+  getVersion,
+  compileStlib,
+  emitDebugArtifacts,
+  type DebugArtifacts,
+} from "../index.js";
 import {
   formatDiagnostic,
   buildSourceMap,
@@ -71,6 +77,10 @@ import { importCodesysLibraryFromBytes } from "../library/codesys-import/index.j
 
 interface CLIOptions {
   inputs: string[];
+  /** Directory for generated_debug.cpp, debug-map.json, debug-info.json and defines.h. */
+  debugArtifacts?: string;
+  /** Program identity served on 0x45; default MD5 over the sources. */
+  md5?: string;
   output?: string;
   debug: boolean;
   lineMapping: boolean;
@@ -243,6 +253,18 @@ function parseArgs(args: string[]): CLIOptions {
       if (nextArg !== undefined) {
         options.libNamespace = nextArg;
       }
+    } else if (arg === "--debug-artifacts") {
+      i++;
+      const nextArg = args[i];
+      if (nextArg !== undefined) {
+        options.debugArtifacts = nextArg;
+      }
+    } else if (arg === "--md5") {
+      i++;
+      const nextArg = args[i];
+      if (nextArg !== undefined) {
+        options.md5 = nextArg;
+      }
     } else if (arg === "--no-probes") {
       options.noProbes = true;
     } else if (arg === "--probe-leaf-rule") {
@@ -326,6 +348,10 @@ Options:
   -L, --lib-path <path>     Library search path (repeatable)
   --no-default-libs         Do not auto-add bundled library paths
   -D, --define NAME=VALUE   Define a global constant (repeatable)
+  --debug-artifacts <dir>   Write generated_debug.cpp, debug-map.json,
+                            debug-info.json and defines.h to <dir>
+  --md5 <hex>               Program MD5 for debug info and defines.h
+                            (default: MD5 over the input files in order)
   -v, --version             Show version
   -h, --help                Show this help
 
@@ -1055,7 +1081,8 @@ async function main(): Promise<void> {
     optimizationLevel: options.optimizationLevel,
     headerFileName,
     fileName: basename(inputPath),
-    debugProbes: !options.noProbes,
+    // Unset unless refused, so the CLI shares compile()'s default.
+    ...(options.noProbes ? { debugProbes: false } : {}),
     debugProbeLeafRule: options.probeLeafRule,
   };
   if (additionalSources.length > 0) {
@@ -1068,6 +1095,9 @@ async function main(): Promise<void> {
   }
   if (Object.keys(options.defines).length > 0) {
     compileOptions.globalConstants = options.defines;
+  }
+  if (options.md5 !== undefined) {
+    compileOptions.md5 = options.md5;
   }
 
   const fileLabel =
@@ -1103,6 +1133,23 @@ async function main(): Promise<void> {
   } catch {
     console.error(`Error: Cannot write output file: ${outputPath}`);
     process.exit(1);
+  }
+
+  if (options.debugArtifacts !== undefined) {
+    const dir = resolve(options.debugArtifacts);
+    try {
+      mkdirSync(dir, { recursive: true });
+      const files: DebugArtifacts = emitDebugArtifacts(result);
+      for (const name of Object.keys(files) as Array<keyof DebugArtifacts>) {
+        writeFileSync(join(dir, name), files[name], "utf-8");
+      }
+      console.log(`Debug artefacts written to ${dir}`);
+    } catch (e) {
+      console.error(
+        `Error: Cannot write debug artefacts to ${dir}: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      process.exit(1);
+    }
   }
 
   console.log("Compilation successful!");

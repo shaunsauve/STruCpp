@@ -16,6 +16,7 @@ import {
 import { parse as parseSource } from "./frontend/parser.js";
 import { resolveGeneratedPragmas } from "./frontend/generated-pragmas.js";
 import type { IToken } from "chevrotain";
+import type { LinkedPou } from "./types.js";
 import { suggestionForParseError } from "./frontend/parser-error-message-provider.js";
 import { buildAST } from "./frontend/ast-builder.js";
 import { transpileILSource } from "./il/il-transpiler.js";
@@ -818,6 +819,32 @@ export function compile(
     if (!reachable || reachable.size === 0) continue;
     codegen.addLibraryChunks(archive, reachable);
   }
+  const linkedPous: LinkedPou[] = [
+    ...pipeline.ast.programs.map((p) => ({
+      name: p.name,
+      kind: "program" as const,
+    })),
+    ...pipeline.ast.functionBlocks.map((f) => ({
+      name: f.name,
+      kind: "fb" as const,
+    })),
+    ...pipeline.ast.functions.map((f) => ({
+      name: f.name,
+      kind: "function" as const,
+    })),
+  ].map((p) => ({ ...p, library: null }));
+  for (const archive of pipeline.allArchives) {
+    const reachable = reachableByArchive.get(archive.manifest.name);
+    for (const chunk of archive.chunks ?? []) {
+      if (!reachable?.has(chunk.name)) continue;
+      if (chunk.kind !== "function" && chunk.kind !== "functionBlock") continue;
+      linkedPous.push({
+        name: chunk.name.toUpperCase(),
+        kind: chunk.kind === "function" ? "function" : "fb",
+        library: archive.manifest.name,
+      });
+    }
+  }
 
   const sourceFiles = [
     {
@@ -885,6 +912,7 @@ export function compile(
       probePlan,
       md5,
       identity,
+      linkedLibraryPous: linkedPous.filter((p) => p.library !== null),
       ...(opts.globalConstants
         ? { globalConstants: opts.globalConstants }
         : {}),
@@ -930,6 +958,7 @@ export function compile(
     lineMap: codeResult.lineMap,
     headerLineMap: codeResult.headerLineMap,
     statements: codeResult.statements,
+    linkedPous,
     errors: pipeline.errors,
     warnings: pipeline.warnings,
     ast: pipeline.ast,
@@ -1065,6 +1094,7 @@ export type {
   SourceSpan,
   LineMapEntry,
   StatementMapEntry,
+  LinkedPou,
   Severity,
 } from "./types.js";
 
@@ -1217,6 +1247,8 @@ export type {
   DebugInfoRefusal,
   ProgramImage,
 } from "./backend/debug-info-gen.js";
+export { emitDebugArtifacts } from "./debug-artifacts.js";
+export type { DebugArtifacts } from "./debug-artifacts.js";
 
 // REPL main generator (for build command)
 export { generateReplMain } from "./backend/repl-main-gen.js";

@@ -21,6 +21,7 @@ import type {
 import type { ProjectModel } from "../project-model.js";
 import type { SymbolTables } from "../semantic/symbol-table.js";
 import type { StlibArchive } from "../library/library-manifest.js";
+import type { LinkedPou } from "../types.js";
 import { isElementaryType } from "../semantic/type-registry.js";
 import { evalIntConst, MAX_TYPE_ALIAS_DEPTH } from "../semantic/type-utils.js";
 import { sha256Hex } from "./sha256.js";
@@ -331,6 +332,8 @@ export interface DebugInfoInput {
   globalConstants?: Record<string, number>;
   /** Probe numbering shared with codegen's `lineMap`. */
   probePlan: ProbePlan;
+  /** Library functions and function blocks linked into the build. */
+  linkedLibraryPous?: LinkedPou[];
 }
 
 /** Var blocks stored in a program or FB instance; VAR_TEMP is frame storage, VAR_EXTERNAL a global. */
@@ -948,12 +951,58 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     if (holds(g.typeId)) walkInstance(g.name, g.typeId);
   }
 
-  // Library blocks have no source here, but are still described.
+  // Library POUs are precompiled C++ with no probes: described, marked no source.
+  const libraryPous: Array<{
+    name: string;
+    kind: "fb" | "function";
+    typeId: number | null;
+    locals: DebugLocal[];
+  }> = [];
+  for (const lib of input.linkedLibraryPous ?? []) {
+    if (lib.kind === "fb") {
+      libraryPous.push({
+        name: lib.name,
+        kind: "fb",
+        typeId: namedType(lib.name),
+        locals: [],
+      });
+      continue;
+    }
+    const fn = symbolTables.lookupFunction(lib.name);
+    libraryPous.push({
+      name: lib.name,
+      kind: "function",
+      typeId: null,
+      locals: (fn?.parameters ?? []).flatMap((v) => {
+        const typeId = typeOf(v.declaration.type);
+        return {
+          name: v.name,
+          typeId,
+          kind: v.isInOut
+            ? "VAR_IN_OUT"
+            : v.isOutput
+              ? "VAR_OUTPUT"
+              : "VAR_INPUT",
+          localsSlot: null,
+        };
+      }),
+    });
+  }
   for (const lib of libraryFbTypes) {
+    if (!libraryPous.some((p) => p.kind === "fb" && p.name === lib.name)) {
+      libraryPous.push({
+        name: lib.name,
+        kind: "fb",
+        typeId: lib.typeId,
+        locals: [],
+      });
+    }
+  }
+  for (const lib of libraryPous) {
     pous.push({
       id: pous.length,
       name: lib.name,
-      kind: "fb",
+      kind: lib.kind,
       owner: null,
       file: null,
       span: null,
@@ -963,7 +1012,7 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
       cppSymbol: null,
       generated: false,
       typeId: lib.typeId,
-      locals: [],
+      locals: lib.locals,
     });
   }
 

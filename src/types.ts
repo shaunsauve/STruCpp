@@ -210,6 +210,12 @@ export interface LineMapEntry {
   stEndCol?: number;
 }
 
+export interface LinkedPou {
+  name: string;
+  kind: "program" | "fb" | "function";
+  library: string | null;
+}
+
 /**
  * One executable statement: its probe, ST range and C++ line range. The
  * source of `debug-info.json` `probes`, one record per probe ID.
@@ -292,6 +298,13 @@ export interface CompileResult {
    * `serializeDebugInfo()` to `debug-info.json`. See debug-info-gen.ts.
    */
   debugInfo?: import("./backend/debug-info-gen.js").DebugInfoV1;
+
+  /**
+   * Every POU linked into this build: the user's programs, function blocks
+   * and functions, and each library function and function block the build
+   * reaches. `library` names the archive, null for user source.
+   */
+  linkedPous?: LinkedPou[];
 
   /** Parsed AST (only populated on successful compilation) */
   ast?: import("./frontend/ast.js").CompilationUnit;
