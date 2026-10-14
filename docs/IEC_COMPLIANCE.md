@@ -26,6 +26,7 @@ STruC++ implements the Structured Text (ST) language from IEC 61131-3. This docu
 |------|--------|-------|
 | TYPE ... END_TYPE | Supported | Type aliases |
 | STRUCT ... END_STRUCT | Supported | With nested structs |
+| UNION ... END_UNION | Supported | CODESYS extension. Members start at one address; a copy keeps the bytes. Each scalar keeps its forcing wrapper, so an array or struct member overlays a scalar member at its first element only. Members take no initial value |
 | Enumerations | Supported | With optional base type |
 | Initialized type declarations | Supported | A type may carry its own default (`Setpoint : REAL := 25.0;`, `Origin : Point := (x := 0.0);`), inherited by every declaration of the type that has no initializer |
 | ARRAY (1D) | Supported | Arbitrary bounds: ARRAY[1..10] OF INT |
@@ -37,12 +38,6 @@ STruC++ implements the Structured Text (ST) language from IEC 61131-3. This docu
 | REF_TO | Supported | IEC reference type (explicit dereference) |
 | REFERENCE_TO | Supported | CODESYS reference type (implicit dereference) |
 | POINTER TO | Supported | CODESYS pointer type with dereference via ^ |
-
-### Not Implemented
-
-| Type | Notes |
-|------|-------|
-| UNION | CODESYS extension |
 
 ## Program Organization Units
 

@@ -1014,6 +1014,7 @@ export class ASTBuilder {
       kind: "StructDefinition",
       sourceSpan: nodeToSourceSpan(node),
       fields,
+      ...(getFirstToken(children.UNION) ? { isUnion: true } : {}),
     };
   }
 

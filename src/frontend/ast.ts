@@ -342,6 +342,8 @@ export type TypeDefinition =
 export interface StructDefinition extends ASTNode {
   kind: "StructDefinition";
   fields: VarDeclaration[];
+  /** Declared UNION ... END_UNION: every field starts at the same address. */
+  isUnion?: boolean;
 }
 
 /**

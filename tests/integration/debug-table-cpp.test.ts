@@ -478,6 +478,81 @@ int main() {
   // to value_, so raw_ptr() agrees the instant a force is applied — but a
   // located variable is driven by the program straight into value_ every scan,
   // and then only read_ptr() still resolves to the forced value.
+  // A UNION's members share storage: a write through one member is what a
+  // read of the other returns, through the program and through the table.
+  it("overlays UNION members, read back through the debug table", () => {
+    const result = compile(
+      `TYPE
+  Word2 : UNION
+    w : WORD;
+    b : ARRAY[0..1] OF BYTE;
+  END_UNION;
+  Pair : STRUCT u : Word2; tail : INT; END_STRUCT;
+END_TYPE
+PROGRAM Main
+VAR u : Word2; copy : Word2; p : Pair; lo : BYTE; END_VAR
+  u.w := 16#1234;
+  lo := u.b[0];
+  copy := u;
+  p.u := copy;
+  p.tail := 7;
+END_PROGRAM${CFG}`,
+      { headerFileName: "generated.hpp" },
+    );
+    expect(result.errors.map((e) => e.message)).toEqual([]);
+    const dir = path.join(tempDir, "union");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "generated.hpp"), result.headerCode);
+    fs.writeFileSync(path.join(dir, "generated.cpp"), result.cppCode);
+    fs.writeFileSync(path.join(dir, "generated_debug.cpp"), result.debugTableCpp!);
+    const idx = (p: string) => {
+      const leaf = result.debugMap!.leaves.find((l) => l.path === p);
+      expect(leaf, `no leaf for ${p}`).toBeTruthy();
+      return `${leaf!.arrayIdx}, ${leaf!.elemIdx}`;
+    };
+    fs.writeFileSync(
+      path.join(dir, "main.cpp"),
+      `#include "generated.hpp"
+#include "debug_dispatch.hpp"
+#include <cstdio>
+#include <cstring>
+strucpp::Configuration_CONFIG0 g_config;
+using namespace strucpp::debug;
+int fails = 0;
+static void chk(const char* what, bool ok) { if (!ok) { printf("FAIL %s\\n", what); ++fails; } }
+static unsigned rd(uint8_t a, uint16_t e) { unsigned char b[8] = {0}; handle_read(a, e, b); unsigned v = 0; memcpy(&v, b, 2); return v; }
+int main() {
+  chk("zero-initialised", rd(${idx("INSTANCE0.U.W")}) == 0);
+  g_config.INSTANCE0.run();
+  chk("w", rd(${idx("INSTANCE0.U.W")}) == 0x1234);
+  chk("b[0] overlays the low byte", (rd(${idx("INSTANCE0.U.B[0]")}) & 0xFF) == 0x34);
+  chk("program read of b[0]", (unsigned)g_config.INSTANCE0.LO == 0x34);
+  chk("copy", rd(${idx("INSTANCE0.COPY.W")}) == 0x1234);
+  chk("union in a struct", rd(${idx("INSTANCE0.P.U.W")}) == 0x1234);
+  chk("member after the union", rd(${idx("INSTANCE0.P.TAIL")}) == 7);
+  printf(fails ? "FAILURES=%d\\n" : "ALL_OK\\n", fails);
+  return fails ? 1 : 0;
+}
+`,
+    );
+    const bin = path.join(dir, "union");
+    execSync(
+      `g++ -std=${CXX_STD} -Wall -Werror -I"${RUNTIME_INCLUDE}" -I"${dir}" ` +
+        `-o "${bin}" "${path.join(dir, "main.cpp")}" ` +
+        `"${path.join(dir, "generated.cpp")}" "${path.join(dir, "generated_debug.cpp")}"`,
+      { encoding: "utf-8" },
+    );
+    expect(execSync(`"${bin}"`, { encoding: "utf-8" }).trim()).toBe("ALL_OK");
+
+    const init = compile(
+      "TYPE U2 : UNION w : WORD := 1; b : BYTE; END_UNION; END_TYPE\n" +
+        `PROGRAM Main VAR u : U2; END_VAR END_PROGRAM${CFG}`,
+    );
+    expect(init.errors.map((e) => e.message)).toEqual([
+      "UNION 'U2' member 'W' cannot have an initial value",
+    ]);
+  });
+
   it("addresses the same value handle_read copies, force included, and exports the build id", () => {
     const result = compile(
       `PROGRAM Main

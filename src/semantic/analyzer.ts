@@ -921,6 +921,15 @@ export class SemanticAnalyzer {
     for (const typeDecl of ast.types) {
       if (typeDecl.definition.kind !== "StructDefinition") continue;
       for (const field of typeDecl.definition.fields) {
+        if (typeDecl.definition.isUnion && field.initialValue) {
+          this.addError(
+            `UNION '${typeDecl.name}' member '${field.names.join(", ")}' cannot have an initial value`,
+            field.sourceSpan.startLine,
+            field.sourceSpan.startCol,
+            field.sourceSpan.file,
+          );
+          continue;
+        }
         this.checkDeclarationInitializer(field, ast);
       }
     }

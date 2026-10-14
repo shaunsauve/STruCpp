@@ -100,7 +100,7 @@ const RULE_DESCRIPTIONS: Record<string, string> = {
   structElementInitializer: "parsing a structure initializer element",
   dataType: "parsing a data type",
   singleTypeDeclaration: "parsing a type declaration",
-  structType: "parsing a STRUCT type",
+  structType: "parsing a STRUCT or UNION type",
   simpleEnumType: "parsing an enum type",
   enumMember: "parsing an enum member",
   arrayType: "parsing an ARRAY type",

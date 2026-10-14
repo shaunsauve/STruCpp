@@ -664,11 +664,27 @@ export class STParser extends CstParser {
    * Structure type definition
    */
   public structType = this.RULE("structType", () => {
-    this.CONSUME(tokens.STRUCT);
-    this.MANY(() => {
-      this.SUBRULE(this.varDeclaration);
-    });
-    this.CONSUME(tokens.END_STRUCT);
+    this.OR([
+      {
+        ALT: () => {
+          this.CONSUME(tokens.STRUCT);
+          this.MANY(() => {
+            this.SUBRULE(this.varDeclaration);
+          });
+          this.CONSUME(tokens.END_STRUCT);
+        },
+      },
+      {
+        // UNION ... END_UNION: members overlay one storage (CODESYS extension).
+        ALT: () => {
+          this.CONSUME(tokens.UNION);
+          this.MANY2(() => {
+            this.SUBRULE2(this.varDeclaration);
+          });
+          this.CONSUME(tokens.END_UNION);
+        },
+      },
+    ]);
   });
 
   /**

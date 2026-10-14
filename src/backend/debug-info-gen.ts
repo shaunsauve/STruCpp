@@ -536,7 +536,7 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
         case "StructDefinition":
           return intern(key, (id) => ({
             id,
-            kind: "struct",
+            kind: def.isUnion ? "union" : "struct",
             name,
             members: membersOf(def.fields, null),
           }));

@@ -343,7 +343,7 @@ export class TypeCodeGenerator {
    *   };
    */
   private generateStructType(name: string, def: StructDefinition): void {
-    this.emit(`struct ${name} {`);
+    this.emit(`${def.isUnion ? "union" : "struct"} ${name} {`);
 
     for (const field of def.fields) {
       let cppType: string;
@@ -371,6 +371,12 @@ export class TypeCodeGenerator {
           )
         : rawPointerType(field.type, cppType, rawType);
       for (const fieldName of field.names) {
+        if (def.isUnion) {
+          this.emit(
+            `${this.options.indent}${cppType} ${mangledMemberName(fieldName, field.type.name, { isUserDefinedType: this.options.isUserDefinedType })};`,
+          );
+          continue;
+        }
         // One rule, shared with the class definition and the debug table — see
         // member-mangling.ts. Compare against the ST type name, not cppType
         // (which may carry a pointer '*' suffix). A STRUCT implements no
@@ -412,8 +418,36 @@ export class TypeCodeGenerator {
       }
     }
 
+    if (def.isUnion) this.emitUnionSpecialMembers(name, def);
     this.emit("};");
     this.emit("");
+  }
+
+  /**
+   * A union of IECVar members has no implicit constructor or copy. These
+   * zero-initialise and copy the object representation, so the members
+   * overlay at offset 0 and a copy keeps whichever member was written last.
+   */
+  private emitUnionSpecialMembers(name: string, def: StructDefinition): void {
+    const i = this.options.indent;
+    const first = def.fields[0]?.names[0];
+    if (first === undefined) return;
+    const firstName = mangledMemberName(first, def.fields[0]!.type.name, {
+      isUserDefinedType: this.options.isUserDefinedType,
+    });
+    const bytes = (src: string) =>
+      `{ unsigned char* d = reinterpret_cast<unsigned char*>(this); ${src}for (unsigned long k = 0; k < sizeof(${name}); ++k) d[k] = ${src ? "s[k]" : "0"}; }`;
+    const copy = bytes(
+      "const unsigned char* s = reinterpret_cast<const unsigned char*>(&o); ",
+    );
+    this.emit(`${i}${name}() noexcept : ${firstName}() ${bytes("")}`);
+    this.emit(
+      `${i}${name}(const ${name}& o) noexcept : ${firstName}() ${copy}`,
+    );
+    this.emit(
+      `${i}${name}& operator=(const ${name}& o) noexcept { if (this != &o) ${copy} return *this; }`,
+    );
+    this.emit(`${i}~${name}() {}`);
   }
 
   /**

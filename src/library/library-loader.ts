@@ -101,6 +101,7 @@ function buildLibraryTypeDefinition(
           referenceKind: "none" as const,
         },
       })),
+      ...(t.union ? { isUnion: true } : {}),
     };
   }
   return {

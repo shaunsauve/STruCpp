@@ -48,7 +48,6 @@ if (!corpusPresent && CORPUS_ENV === undefined) {
 /** Corpus programs STruCpp cannot compile yet, with the reason. */
 const EXPECTED_FAIL: Record<string, string> = {
   "generated-region": "the {strucpp generated} pragmas are not lexed yet",
-  "rich-types": "UNION types are not parsed",
 };
 
 /** A corpus `reject-*.st` must be refused, with a diagnostic naming its
@@ -624,13 +623,17 @@ describe("debug-info.json: variables of every scope with IEC types (A013)", () =
 });
 
 describe("debug-info.json: rich types (A016)", () => {
-  // openplc-runtime corpus:rich-types without its UNION, which STruCpp does not parse.
+  // Mirrors openplc-runtime corpus:rich-types.
   const built = lazy(() =>
     debugInfoOf(`
 TYPE
   Pct : INT (0..100);
   Point : STRUCT x : INT; y : INT; END_STRUCT;
   Seg : STRUCT a : Point; END_STRUCT;
+  Word2 : UNION
+    w : WORD;
+    b : ARRAY[0..1] OF BYTE;
+  END_UNION;
 END_TYPE
 PROGRAM Rich
   VAR
@@ -641,8 +644,10 @@ PROGRAM Rich
     p : Pct := 50;
     target : INT := 7;
     r : REF_TO INT;
+    u : Word2;
   END_VAR
   r := REF(target);
+  u.w := 16#1234;
 END_PROGRAM
 ${CONFIG("Rich")}`),
   );
@@ -685,6 +690,16 @@ ${CONFIG("Rich")}`),
     expect(p).toMatchObject({ kind: "subrange", name: "PCT", range: [0, 100] });
     expect(typeLabel(info, p.base!)).toBe("INT");
     expect(typeLabel(info, typeOf("R").id)).toBe("REF_TO INT");
+  });
+
+  it("gives a union its name and overlaid members", () => {
+    const { info } = built();
+    const u = typeOf("U");
+    expect(u).toMatchObject({ kind: "union", name: "WORD2" });
+    expect(u.members!.map((m) => [m.name, typeLabel(info, m.typeId)])).toEqual([
+      ["W", "WORD"],
+      ["B", "ARRAY[0..1] OF BYTE"],
+    ]);
   });
 });
 

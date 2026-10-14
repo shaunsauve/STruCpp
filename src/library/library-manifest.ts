@@ -179,6 +179,8 @@ export interface LibraryTypeEntry {
    *  can type member access on a dependency struct (e.g. `MATH.PI`). Only set
    *  for `kind: "struct"`; optional for backward compatibility. */
   fields?: Array<{ name: string; type: string }>;
+  /** Set for a struct declared UNION: its fields overlay one storage. */
+  union?: true;
   /** Type-level help text — same lifecycle as `LibraryFBEntry.documentation`,
    *  populated automatically from the structured doc-block slot in CODESYS
    *  imports (typically the type's revision-history comment for OSCAT) and

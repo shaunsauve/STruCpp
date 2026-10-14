@@ -701,6 +701,7 @@ export function compileLibrary(
         name: string;
         kind: typeof kind;
         fields?: Array<{ name: string; type: string }>;
+        union?: true;
       } = { name: t.name, kind };
       // Export struct member fields so consumers can type `x.field` access
       // on a dependency struct.
@@ -708,6 +709,7 @@ export function compileLibrary(
         entry.fields = t.definition.fields.flatMap((decl) =>
           decl.names.map((name) => ({ name, type: decl.type.name })),
         );
+        if (t.definition.isUnion) entry.union = true;
       }
       return tagDocumentation(tagCategory(entry, catByName), docByName);
     }),
