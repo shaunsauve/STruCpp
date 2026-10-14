@@ -478,7 +478,7 @@ int main() {
   // to value_, so raw_ptr() agrees the instant a force is applied — but a
   // located variable is driven by the program straight into value_ every scan,
   // and then only read_ptr() still resolves to the forced value.
-  it("addresses the same value handle_read copies, force included", () => {
+  it("addresses the same value handle_read copies, force included, and exports the build id", () => {
     const result = compile(
       `PROGRAM Main
 VAR n : DINT := 7; END_VAR
@@ -500,6 +500,10 @@ END_PROGRAM${CFG}`,
       result.debugTableCpp!,
     );
 
+    expect(result.debugMap!.debugInfo!.buildId).toBe(
+      result.debugInfo!.build.buildId,
+    );
+
     const idx = (p: string) => {
       const leaf = result.debugMap!.leaves.find((l) => l.path === p);
       expect(leaf, `no leaf for ${p}`).toBeTruthy();
@@ -513,6 +517,8 @@ END_PROGRAM${CFG}`,
 #include <cstdio>
 #include <cstring>
 strucpp::Configuration_CONFIG0 g_config;
+// The runtime resolves this unmangled data symbol with dlsym (ADR-002 D1).
+extern "C" const char strucpp_dbg_build_id[];
 using namespace strucpp::debug;
 int fails = 0;
 static void chk(const char* what, bool ok) { if (!ok) { printf("FAIL %s\\n", what); ++fails; } }
@@ -592,6 +598,8 @@ int main() {
   const void* ewp = handle_ptr(${idx("INSTANCE0.EW")}, &len);
   chk("empty wstring len", len == 0);
   chk("empty wstring ptr non-null", ewp != nullptr);
+
+  chk("build id", strcmp(strucpp_dbg_build_id, "${result.debugInfo!.build.buildId}") == 0);
 
   // Out of range is a null, not a crash.
   chk("oob is null", handle_ptr(200, 0, &len) == nullptr && len == 0);

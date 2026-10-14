@@ -33,6 +33,11 @@ import { isElementaryType } from "../semantic/type-registry.js";
 import { evalIntConst, MAX_TYPE_ALIAS_DEPTH } from "../semantic/type-utils.js";
 import { formatArrayElementAccess } from "./codegen-utils.js";
 import { mangledMemberName } from "./member-mangling.js";
+import {
+  DEBUG_INFO_FILE,
+  DEBUG_INFO_MAJOR,
+  DEBUG_INFO_MINOR,
+} from "./debug-info-gen.js";
 
 // ---------------------------------------------------------------------------
 // Type tags — MUST match TypeTag enum in runtime/include/debug_dispatch.hpp.
@@ -323,6 +328,11 @@ export interface DebugMapV2 {
    * discard retained state on every unrelated edit.
    */
   retainLayoutHash?: string;
+  /**
+   * Link to the sibling `debug-info.json` of the same build. Additive, so
+   * `version` stays 2 and today's editor ignores it.
+   */
+  debugInfo?: { file: string; major: number; minor: number; buildId: string };
 }
 
 export interface DebugTableResult {
@@ -351,9 +361,11 @@ export interface DebugTableGenOptions {
   /** MD5 to embed in the debug map. Caller computes over (program.st,
    *  strucpp version, projectModel) so the editor can detect staleness. */
   md5?: string;
+  /** Build identity: emitted as `strucpp_dbg_build_id` and linked from the map. */
+  buildId?: string;
 }
 
-const DEFAULTS: Required<Omit<DebugTableGenOptions, "md5">> = {
+const DEFAULTS: Required<Omit<DebugTableGenOptions, "md5" | "buildId">> = {
   maxEntriesPerArray: 8000,
   configGlobalName: "g_config",
 };
@@ -1030,6 +1042,7 @@ export function generateDebugTable(
     configName,
     retainVars,
     retainLayoutHash,
+    opts.buildId,
   );
   const debugMap: DebugMapV2 = {
     version: 2,
@@ -1037,6 +1050,16 @@ export function generateDebugTable(
     typeTags: { ...TAG },
     arrays: arrays.map((a, i) => ({ index: i, count: a.length })),
     leaves,
+    ...(opts.buildId !== undefined
+      ? {
+          debugInfo: {
+            file: DEBUG_INFO_FILE,
+            major: DEBUG_INFO_MAJOR,
+            minor: DEBUG_INFO_MINOR,
+            buildId: opts.buildId,
+          },
+        }
+      : {}),
     // Omitted entirely when nothing is retained, so a project that uses no
     // RETAIN carries no retain fields at all and the runtime's `count == 0`
     // fast path is the only thing it ever sees.
@@ -1071,6 +1094,7 @@ function renderCpp(
   configName: string,
   retainVars: Array<{ arrayIdx: number; elemIdx: number; path: string }>,
   retainLayoutHash: string,
+  buildId: string | undefined,
 ): string {
   const lines: string[] = [];
   lines.push("// SPDX-License-Identifier: GPL-3.0-or-later");
@@ -1174,6 +1198,13 @@ function renderCpp(
   lines.push(`const uint32_t retain_layout_hash = 0x${retainLayoutHash};`);
   lines.push("");
   lines.push("} } // namespace strucpp::debug");
+  if (buildId !== undefined) {
+    lines.push("");
+    lines.push(
+      "// Build identity of debug-info.json; resolved by name at load.",
+    );
+    lines.push(`extern "C" const char strucpp_dbg_build_id[] = "${buildId}";`);
+  }
   return lines.join("\n") + "\n";
 }
 

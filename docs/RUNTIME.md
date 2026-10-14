@@ -264,7 +264,9 @@ read through a shared global (refused when the getter's FB declares a `VAR_EXTER
 
 `--no-probes` emits none of this: no polls, clones, flags or lock-depth counter, and
 `strucpp_dbg_probe_count()` returns 0. Watch and force work as before through
-`generated_debug.cpp`. `--probe-leaf-rule` drops the entry poll of leaf functions and FBs
+`generated_debug.cpp`, which in every build also defines `extern "C" const char
+strucpp_dbg_build_id[]`, the build identity of `debug-info.json` (see `DEBUG_INFO.md`, Build
+binding). `--probe-leaf-rule` drops the entry poll of leaf functions and FBs
 (no POU call, no loop, at most 32 statements); probed callers enter their probed clone
 directly.
 

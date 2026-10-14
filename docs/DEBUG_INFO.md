@@ -6,9 +6,10 @@ variable of every scope with its IEC type, the instance tree, and the statement 
 - Schema: [`debug-info.schema.json`](debug-info.schema.json) (JSON Schema draft-07).
 - Produced by `compile()` as `CompileResult.debugInfo`; serialise it with `serializeDebugInfo()`
   (`src/backend/debug-info-gen.ts`), which sorts keys so equal inputs give equal bytes.
-- It sits beside `debug-map.json` (`DebugMapV2`), which it does not change. Static storage is
-  addressed through `debug-map.json` leaves; this file only says where each instance and global
-  starts in them.
+- It sits beside `debug-map.json` (`DebugMapV2`). Static storage is addressed through
+  `debug-map.json` leaves; this file only says where each instance and global starts in them.
+- Read it with `readDebugInfo(text, image?)` (exported from the package), which applies the
+  version and build-binding rules below.
 
 All names are upper-cased, as the compiler folds identifiers and as `debug-map.json` leaf paths
 are written. IEC identifiers are case-insensitive, so a reader compares them that way.
@@ -23,11 +24,29 @@ are written. IEC identifiers are case-insensitive, so a reader compares them tha
 
 `debug-map.json`'s own `version: 2` is a separate axis and does not move with this format.
 
+`readDebugInfo` refuses a file whose `format` differs or whose `major` is not `1` with
+`UNSUPPORTED_DEBUG_INFO`, `details: {found, supported}` (`found` is `null` when there is no
+integer major), and accepts any `minor`.
+
+## Build binding
+
+Three artefacts of one build carry the same `buildId`:
+
+| Where | What |
+|---|---|
+| `debug-info.json` | `build.buildId` (below). |
+| `debug-map.json` | One additive top-level key, `"debugInfo": {"file": "debug-info.json", "major": 1, "minor": 0, "buildId": "<hex>"}`. `version` stays `2`; the editor's loader ignores the key. |
+| `generated_debug.cpp` | `extern "C" const char strucpp_dbg_build_id[]`, the 64-character hex id, NUL-terminated. Emitted in every build, probes on or off; the runtime resolves it by name. |
+
+`readDebugInfo(text, {md5, buildId})` refuses debug info of another build with `STALE_BUILD`,
+`details: {reason, expected, found}`: `reason` is `source` when the md5 differs, else `build`
+when the buildId differs. A `null` image `buildId` compares by md5 alone.
+
 ## `build`
 
 | Field | Meaning |
 |---|---|
-| `md5` | Program identity, the value served on the runtime's 0x45 request: the caller's `md5` option verbatim, or empty when the caller supplied none. |
+| `md5` | Program identity, the value served on the runtime's 0x45 request: the caller's `md5` option verbatim, or else MD5 over the UTF-8 bytes of the user source files concatenated in compile order (for a single `program.st`, the editor's value). `debug-map.json` `md5` is the same value. |
 | `buildId` | Build identity, SHA-256 (hex) over the compiler version, the canonical `options`, each source file's path and SHA-256, and each library's name, version and content hash. Computed from inputs, so it is known before code generation. |
 | `compiler` | `"strucpp <version>"`. |
 | `options` | The compile options that change generated code, with sorted keys. `debugProbes` is always present. |

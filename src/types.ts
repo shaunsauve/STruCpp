@@ -74,10 +74,9 @@ export interface CompileOptions {
   globalConstants?: Record<string, number>;
 
   /**
-   * MD5 string embedded in the debug map + exposed to the target via
-   * FC 0x45. Caller computes over (program.st, strucpp version, any other
-   * state that should invalidate the editor's cached layout). If unset,
-   * the debug map's md5 field is left empty.
+   * Program identity embedded in the debug map and debug info and served on
+   * FC 0x45. Used verbatim when set; otherwise MD5 over the UTF-8 user
+   * sources concatenated in compile order.
    */
   md5?: string;
 

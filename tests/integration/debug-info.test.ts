@@ -19,9 +19,12 @@ import { compile } from "../../src/index.js";
 import { compileStlib } from "../../src/library/library-compiler.js";
 import { discoverStlibs } from "../../src/node/library-loader.js";
 import {
+  readDebugInfo,
   serializeDebugInfo,
   type DebugInfoV1,
 } from "../../src/backend/debug-info-gen.js";
+import type { DebugMapV2 } from "../../src/backend/debug-table-gen.js";
+import * as vendoredEditorParser from "../fixtures/openplc-editor/debug-parser.js";
 import type { StlibArchive } from "../../src/library/library-manifest.js";
 import type { LineMapEntry } from "../../src/types.js";
 
@@ -79,6 +82,33 @@ function schemaErrors(json: string): string[] {
 
 const stdLibs = discoverStlibs(LIBS_DIR);
 
+/**
+ * Today's editor loader (A023): the vendored copy of openplc-editor
+ * `src/frontend/utils/debug-parser.ts` (74a3e197), and the live file when an
+ * editor checkout is present (OPENPLC_EDITOR_DIR, default a sibling checkout).
+ */
+type EditorParser = Pick<
+  typeof vendoredEditorParser,
+  "parseDebugMap" | "buildLeafPathMap"
+>;
+const EDITOR_DIR =
+  process.env["OPENPLC_EDITOR_DIR"] ?? path.resolve(ROOT, "../openplc-editor");
+const LIVE_EDITOR_PARSER = path.join(
+  EDITOR_DIR,
+  "src/frontend/utils/debug-parser.ts",
+);
+const editorLoaders: Array<{ label: string; parser: EditorParser }> = [
+  { label: "vendored editor loader", parser: vendoredEditorParser },
+];
+if (fs.existsSync(LIVE_EDITOR_PARSER)) {
+  editorLoaders.push({
+    label: `editor loader at ${LIVE_EDITOR_PARSER}`,
+    parser: (await import(LIVE_EDITOR_PARSER)) as EditorParser,
+  });
+} else {
+  console.warn(`live editor loader not checked: no ${LIVE_EDITOR_PARSER}`);
+}
+
 function headerValue(source: string, key: string): string | undefined {
   const header = source.slice(0, source.indexOf("*)"));
   const m = new RegExp(`^\\s*${key}:\\s*(.+)$`, "m").exec(header);
@@ -112,6 +142,7 @@ interface CorpusBuild {
   label: string;
   ok: boolean;
   info?: DebugInfoV1;
+  map?: DebugMapV2;
   error?: string;
   sources: Array<{ fileName: string; source: string }>;
   lineMap?: Map<number, LineMapEntry>;
@@ -168,6 +199,7 @@ function buildCorpus(name: string): CorpusBuild[] {
         lineMap: r.lineMap,
         warnings: r.warnings.map((w) => w.message),
         ...(r.debugInfo ? { info: r.debugInfo } : {}),
+        ...(r.debugMap ? { map: r.debugMap } : {}),
       };
     } catch (e) {
       return { label, ok: false, sources, error: String(e) };
@@ -221,6 +253,17 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
         expect(b.error, b.label).toBeUndefined();
         expect(b.info, `${b.label}: no debugInfo`).toBeDefined();
         expect(schemaErrors(serializeDebugInfo(b.info!)), b.label).toEqual([]);
+        // A023: the extended map, serialised as the editor writes it, still
+        // loads in today's editor and resolves every leaf.
+        for (const editor of editorLoaders) {
+          const json = JSON.stringify(b.map, null, 2);
+          const loaded = editor.parser.parseDebugMap(json);
+          expect(loaded, `${b.label}: refused by ${editor.label}`).toBeDefined();
+          expect(
+            editor.parser.buildLeafPathMap(loaded!).size,
+            `${b.label}: ${editor.label} leaf count`,
+          ).toBe(new Set(b.map!.leaves.map((l) => l.path.toUpperCase())).size);
+        }
       }
     });
 
@@ -231,6 +274,116 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
       };
       json.types[0]!.id = "0";
       expect(schemaErrors(JSON.stringify(json))).not.toEqual([]);
+    });
+
+    it("binds debug-map, debug-info, md5 and buildId to one build (A014 compiler side, A023)", () => {
+      const [a] = corpusBuilds("plant-io");
+      const md5Of = (sources: Array<{ source: string }>) =>
+        createHash("md5")
+          .update(sources.map((s) => s.source).join(""))
+          .digest("hex");
+      const image = (info: DebugInfoV1) => ({
+        md5: info.build.md5,
+        buildId: info.build.buildId,
+      });
+      const infoA = a!.info!;
+      expect(infoA.build.buildId).toMatch(/^[0-9a-f]{64}$/);
+      expect(infoA.build.md5).toBe(md5Of(a!.sources));
+      expect(a!.map!.md5).toBe(infoA.build.md5);
+      expect(a!.map!.debugInfo).toEqual({
+        file: "debug-info.json",
+        major: 1,
+        minor: 0,
+        buildId: infoA.build.buildId,
+      });
+
+      const rebuild = (src: string, debugProbes?: boolean) => {
+        const [first, ...rest] = a!.sources;
+        const r = compile(src, {
+          fileName: first!.fileName,
+          additionalSources: rest,
+          libraries: corpusLibraries(path.join(CORPUS_DIR, "plant-io"), "plant-io"),
+          ...(debugProbes === undefined ? {} : { debugProbes }),
+        });
+        expect(r.errors.map((e) => e.message)).toEqual([]);
+        return r.debugInfo!;
+      };
+      const src = a!.sources[0]!.source;
+      expect(rebuild(src).build.buildId, "deterministic").toBe(infoA.build.buildId);
+      const edited = rebuild(src.replace(/:=\s*(\d+)\s*;/, ":= $1 + 1;"));
+      const otherOptions = rebuild(src, !infoA.build.probes);
+      expect(otherOptions.build.md5).toBe(infoA.build.md5);
+      expect(otherOptions.build.buildId).not.toBe(infoA.build.buildId);
+
+      const json = serializeDebugInfo(infoA);
+      expect(readDebugInfo(json, image(infoA)).ok).toBe(true);
+      expect(readDebugInfo(json, { md5: infoA.build.md5, buildId: null }).ok).toBe(true);
+      for (const [other, reason] of [
+        [edited, "source"],
+        [otherOptions, "build"],
+      ] as const) {
+        const r = readDebugInfo(json, image(other));
+        expect(r.ok, reason).toBe(false);
+        if (r.ok) continue;
+        expect(r.error.code).toBe("STALE_BUILD");
+        expect(r.error.details).toEqual({
+          reason,
+          expected: image(other),
+          found: image(infoA),
+        });
+      }
+
+      // The caller's md5 is used verbatim (today's editor value).
+      const given = compile(src, {
+        fileName: a!.sources[0]!.fileName,
+        additionalSources: a!.sources.slice(1),
+        libraries: corpusLibraries(path.join(CORPUS_DIR, "plant-io"), "plant-io"),
+        md5: "0123456789abcdef0123456789abcdef",
+      });
+      expect(given.debugInfo!.build.md5).toBe("0123456789abcdef0123456789abcdef");
+      expect(given.debugMap!.md5).toBe("0123456789abcdef0123456789abcdef");
+    });
+
+    it("refuses an unsupported major and ignores a minor addition (A017)", () => {
+      const [b] = corpusBuilds("nested-fb-loop");
+      const base = JSON.parse(serializeDebugInfo(b!.info!)) as Record<
+        string,
+        unknown
+      > & { build: Record<string, unknown> };
+      const variant = (patch: (d: typeof base) => void) => {
+        const d = structuredClone(base);
+        patch(d);
+        return JSON.stringify(d);
+      };
+
+      const minor = readDebugInfo(
+        variant((d) => {
+          d["minor"] = 1;
+          d["futureTable"] = [1, 2, 3];
+          d.build["futureField"] = "x";
+        }),
+      );
+      expect(minor.ok).toBe(true);
+      if (minor.ok) {
+        expect(minor.info.minor).toBe(1);
+        expect(minor.info.probes).toEqual(b!.info!.probes);
+      }
+
+      for (const [label, patch, found] of [
+        ["major+1", (d: typeof base) => void (d["major"] = 2), 2],
+        ["major 0", (d: typeof base) => void (d["major"] = 0), 0],
+        ["no major", (d: typeof base) => void delete d["major"], null],
+        ["other format", (d: typeof base) => void (d["format"] = "x"), null],
+      ] as const) {
+        const r = readDebugInfo(variant(patch));
+        expect(r.ok, `${label} must never load`).toBe(false);
+        if (r.ok) continue;
+        expect(r.error.code, label).toBe("UNSUPPORTED_DEBUG_INFO");
+        expect(r.error.details, label).toEqual({ found, supported: 1 });
+        if (found !== null) expect(r.error.message, label).toContain(String(found));
+        expect(r.error.message, label).toContain("1");
+      }
+      expect(readDebugInfo("not json").ok).toBe(false);
     });
 
     it("keeps the largest corpus program's debug-info under 1.5 MB (A021)", () => {

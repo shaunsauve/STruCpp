@@ -27,9 +27,11 @@ import {
   type DebugMapV2,
 } from "./backend/debug-table-gen.js";
 import {
+  computeBuildIdentity,
   generateDebugInfo,
   type DebugInfoV1,
 } from "./backend/debug-info-gen.js";
+import { md5Hex } from "./backend/md5.js";
 import { StdFunctionRegistry } from "./semantic/std-function-registry.js";
 import type {
   CompilationUnit,
@@ -833,24 +835,10 @@ export function compile(
   let debugMap: DebugMapV2 | undefined;
   let debugInfo: DebugInfoV1 | undefined;
   if (pipeline.projectModel && pipeline.symbolTables) {
-    const dbg = generateDebugTable(
-      pipeline.ast,
-      pipeline.projectModel,
-      pipeline.symbolTables,
-      { md5: pipeline.mergedOptions.md5 ?? "" },
-    );
-    debugTableCpp = dbg.debugTableCpp;
-    debugMap = dbg.debugMap;
     const opts = pipeline.mergedOptions;
-    debugInfo = generateDebugInfo({
-      ast: pipeline.ast,
-      projectModel: pipeline.projectModel,
-      symbolTables: pipeline.symbolTables,
-      leafPaths: dbg.debugMap.leaves.map((l) => l.path),
-      sources: sourceFiles,
-      probePlan,
-      libraries: pipeline.allArchives,
-      md5: opts.md5 ?? "",
+    // Caller's md5 verbatim, else MD5 over the user sources in compile order.
+    const md5 = opts.md5 ?? md5Hex(sourceFiles.map((f) => f.source).join(""));
+    const identity = computeBuildIdentity({
       compilerVersion: getVersion(),
       options: {
         isTestBuild: opts.isTestBuild ?? false,
@@ -858,6 +846,26 @@ export function compile(
         debugProbes: opts.debugProbes ?? true,
         ...(opts.debugProbeLeafRule ? { debugProbeLeafRule: true } : {}),
       },
+      sources: sourceFiles,
+      libraries: pipeline.allArchives,
+    });
+    const dbg = generateDebugTable(
+      pipeline.ast,
+      pipeline.projectModel,
+      pipeline.symbolTables,
+      { md5, buildId: identity.buildId },
+    );
+    debugTableCpp = dbg.debugTableCpp;
+    debugMap = dbg.debugMap;
+    debugInfo = generateDebugInfo({
+      ast: pipeline.ast,
+      projectModel: pipeline.projectModel,
+      symbolTables: pipeline.symbolTables,
+      leafPaths: dbg.debugMap.leaves.map((l) => l.path),
+      sources: sourceFiles,
+      probePlan,
+      md5,
+      identity,
       ...(opts.globalConstants
         ? { globalConstants: opts.globalConstants }
         : {}),
@@ -1171,6 +1179,19 @@ export type {
   CodesysFormat,
   CodesysImportResult,
 } from "./library/codesys-import/index.js";
+
+// Debug-info reader and build binding
+export {
+  readDebugInfo,
+  serializeDebugInfo,
+  DEBUG_INFO_FILE,
+  DEBUG_INFO_MAJOR,
+} from "./backend/debug-info-gen.js";
+export type {
+  DebugInfoReadResult,
+  DebugInfoRefusal,
+  ProgramImage,
+} from "./backend/debug-info-gen.js";
 
 // REPL main generator (for build command)
 export { generateReplMain } from "./backend/repl-main-gen.js";

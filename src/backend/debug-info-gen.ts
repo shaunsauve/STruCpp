@@ -171,6 +171,145 @@ export function serializeDebugInfo(info: DebugInfoV1): string {
 }
 
 // ---------------------------------------------------------------------------
+// Build identity
+// ---------------------------------------------------------------------------
+
+/** Name of the debug-info file `debug-map.json`'s `debugInfo.file` links to. */
+export const DEBUG_INFO_FILE = "debug-info.json";
+
+export interface BuildIdentity {
+  buildId: string;
+  compiler: string;
+  /** Canonical options, `debugProbes` always present. */
+  options: Record<string, unknown>;
+}
+
+/**
+ * SHA-256 over the compiler version, the canonical options, each source's
+ * path and SHA-256, and each library's name, version and content hash.
+ * Input-only, so it is known before code generation.
+ */
+export function computeBuildIdentity(input: {
+  compilerVersion: string;
+  /** Compile options that change generated code. */
+  options: Record<string, unknown>;
+  sources: Array<{ fileName: string; source: string }>;
+  libraries: StlibArchive[];
+}): BuildIdentity {
+  const options = { debugProbes: false, ...input.options };
+  const compiler = `strucpp ${input.compilerVersion}`;
+  const buildId = sha256Hex(
+    [
+      compiler,
+      canonicalJson(options),
+      ...input.sources.map((f) => `${f.fileName}\n${sha256Hex(f.source)}`),
+      ...input.libraries.map(
+        (l) => `${l.manifest.name}\n${l.manifest.version}\n${archiveHash(l)}`,
+      ),
+    ].join("\n"),
+  );
+  return { buildId, compiler, options };
+}
+
+// ---------------------------------------------------------------------------
+// Reader
+// ---------------------------------------------------------------------------
+
+/** What a loaded program reports about itself; a null `buildId` compares by md5 alone. */
+export interface ProgramImage {
+  md5: string | null;
+  buildId: string | null;
+}
+
+export type DebugInfoRefusal =
+  | {
+      code: "UNSUPPORTED_DEBUG_INFO";
+      message: string;
+      details: { found: number | null; supported: number };
+    }
+  | {
+      code: "STALE_BUILD";
+      message: string;
+      details: {
+        reason: "source" | "build";
+        expected: ProgramImage;
+        found: ProgramImage;
+      };
+    };
+
+export type DebugInfoReadResult =
+  | { ok: true; info: DebugInfoV1 }
+  | { ok: false; error: DebugInfoRefusal };
+
+/**
+ * Parse `debug-info.json`. Refuses another format or an unsupported major;
+ * accepts any minor and keeps unknown properties unread. With `image`, also
+ * refuses debug info of another build: md5 first (`source`), then buildId
+ * (`build`).
+ */
+export function readDebugInfo(
+  text: string,
+  image?: ProgramImage,
+): DebugInfoReadResult {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    doc = null;
+  }
+  const obj =
+    doc !== null && typeof doc === "object" && !Array.isArray(doc)
+      ? (doc as Record<string, unknown>)
+      : {};
+  const major = obj["major"];
+  const found =
+    obj["format"] === DEBUG_INFO_FORMAT && Number.isInteger(major)
+      ? (major as number)
+      : null;
+  if (found !== DEBUG_INFO_MAJOR) {
+    return {
+      ok: false,
+      error: {
+        code: "UNSUPPORTED_DEBUG_INFO",
+        message:
+          found === null
+            ? `Not ${DEBUG_INFO_FORMAT} with an integer major version; this reader reads major ${DEBUG_INFO_MAJOR}.`
+            : `The debug information is major version ${found}; this reader reads major ${DEBUG_INFO_MAJOR}.`,
+        details: { found, supported: DEBUG_INFO_MAJOR },
+      },
+    };
+  }
+  const info = obj as unknown as DebugInfoV1;
+  if (image) {
+    const build = (info.build ?? {}) as Partial<DebugInfoV1["build"]>;
+    const own: ProgramImage = {
+      md5: build.md5 ?? null,
+      buildId: build.buildId ?? null,
+    };
+    const reason =
+      image.md5 !== own.md5
+        ? "source"
+        : image.buildId !== null && image.buildId !== own.buildId
+          ? "build"
+          : null;
+    if (reason !== null) {
+      return {
+        ok: false,
+        error: {
+          code: "STALE_BUILD",
+          message:
+            reason === "source"
+              ? `The debug information is for another program (md5 ${own.md5}, running ${String(image.md5)}).`
+              : `The debug information is for another build of this program (buildId ${own.buildId}, running ${image.buildId}).`,
+          details: { reason, expected: image, found: own },
+        },
+      };
+    }
+  }
+  return { ok: true, info };
+}
+
+// ---------------------------------------------------------------------------
 // Generator
 // ---------------------------------------------------------------------------
 
@@ -182,12 +321,10 @@ export interface DebugInfoInput {
   leafPaths: string[];
   /** User sources in compile order, as given to the compiler. */
   sources: Array<{ fileName: string; source: string }>;
-  libraries: StlibArchive[];
-  /** Program identity as served on 0x45; empty when the caller gave none. */
+  /** Program identity as served on 0x45. */
   md5: string;
-  compilerVersion: string;
-  /** Compile options that change generated code. */
-  options: Record<string, unknown>;
+  /** From `computeBuildIdentity`, so the debug table embeds the same id. */
+  identity: BuildIdentity;
   globalConstants?: Record<string, number>;
   /** Probe numbering shared with codegen's `lineMap`. */
   probePlan: ProbePlan;
@@ -820,18 +957,7 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
 
   // --- Build identity --------------------------------------------------------
 
-  const options = { debugProbes: false, ...input.options };
-  const compiler = `strucpp ${input.compilerVersion}`;
-  const buildId = sha256Hex(
-    [
-      compiler,
-      canonicalJson(options),
-      ...files.map((f) => `${f.path}\n${f.sha256}`),
-      ...input.libraries.map(
-        (l) => `${l.manifest.name}\n${l.manifest.version}\n${archiveHash(l)}`,
-      ),
-    ].join("\n"),
-  );
+  const { buildId, compiler, options } = input.identity;
 
   return {
     format: DEBUG_INFO_FORMAT,
