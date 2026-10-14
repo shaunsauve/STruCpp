@@ -70,6 +70,7 @@ import {
   translateIECString,
 } from "./codegen-utils.js";
 import { mangledMemberName, needsMemberMangling } from "./member-mangling.js";
+import { getterLockReach } from "./global-lock-reach.js";
 import {
   getTypeBits,
   getTypeCategory,
@@ -4433,22 +4434,32 @@ export class CodeGenerator {
 
   /**
    * A property getter read through a shared global runs under that global's
-   * lock. If its FB declares a VAR_EXTERNAL, the getter would take a second
-   * shared-global lock inside the first (or the same one again): refused.
+   * lock. If its FB declares a VAR_EXTERNAL, or the getter reaches a global
+   * through what it calls, it would take a second shared-global lock inside
+   * the first (or the same one again): refused.
    */
   private refuseLockedGetter(fbType: string | undefined, prop: string): void {
     const fb = this.ast?.functionBlocks.find(
       (f) => f.name.toUpperCase() === fbType?.toUpperCase(),
     );
-    if (fb?.varBlocks.some((b) => b.blockType === "VAR_EXTERNAL") !== true) {
-      return;
-    }
-    throw new Error(
+    if (!fb || !this.ast) return;
+    const lead =
       `Property '${prop}' of function block '${fb.name}' is read through a shared ` +
-        `global, so its getter runs under that global's lock; '${fb.name}' declares ` +
-        `a VAR_EXTERNAL, so the getter would take a second shared-global lock inside ` +
-        `the first. Read the property from an instance that is not a shared global.`,
-    );
+      `global, so its getter runs under that global's lock; `;
+    const tail = `Read the property from an instance that is not a shared global.`;
+    if (fb.varBlocks.some((b) => b.blockType === "VAR_EXTERNAL")) {
+      throw new Error(
+        `${lead}'${fb.name}' declares a VAR_EXTERNAL, so the getter would take a ` +
+          `second shared-global lock inside the first. ${tail}`,
+      );
+    }
+    const via = getterLockReach(this.ast, fb.name, prop);
+    if (via !== undefined) {
+      throw new Error(
+        `${lead}the getter ${via}, so it would take a second shared-global lock ` +
+          `inside the first. ${tail}`,
+      );
+    }
   }
 
   /**

@@ -260,7 +260,10 @@ without a host; `runtime/test/debug_probe_stub.hpp` is a host for tests.
 Under `STRUCPP_THREADED`, `GlobalVar::read`, `write` and `with_lock` count the calling
 thread's shared-global lock depth. Codegen evaluates subscripts and `=>` capture sources
 before taking a global's lock, so no user code runs under one except a property getter
-read through a shared global (refused when the getter's FB declares a `VAR_EXTERNAL`).
+read through a shared global. That getter is refused at compile time when its FB declares a
+`VAR_EXTERNAL`, or when it reaches one through what it calls: a function, an FB instance, a
+method or another property whose body names a `VAR_EXTERNAL`, at any depth
+(`src/backend/global-lock-reach.ts`).
 
 `--no-probes` emits none of this: no polls, clones, flags or lock-depth counter, and
 `strucpp_dbg_probe_count()` returns 0. Watch and force work as before through

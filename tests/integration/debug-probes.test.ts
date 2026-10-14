@@ -1615,6 +1615,66 @@ describe("A204: no probe parks under a shared-global lock (S1-S8)", () => {
     expect(() => compile(s8, { headerFileName: "generated.hpp" })).toThrow(/shared function-block global/i);
   });
 
+  // ADR-001 open item 3: a getter that reaches a global through what it calls nests locks too.
+  it.each([
+    ["invokes a member FB that reads the global itself", "    r : Reader;", "      r();\n      level := r.v;", "", /getter.*'READER'.*VAR_EXTERNAL 'G_FB'/i],
+    ["calls a function that reads a global", "", "      level := GF(1);", "", /getter.*'GF'.*VAR_EXTERNAL 'G_S'/i],
+    ["calls a member's method that invokes such an FB", "    o : Outer;", "      level := o.Touch();", "", /getter.*'OUTER\.TOUCH'.*'READER'.*'G_FB'/i],
+    ["reads a member's property whose getter calls such a function", "    n : Inner;", "      level := n.Q;", "", /getter.*'INNER\.Q'.*'GF'.*'G_S'/i],
+    ["invokes a member FB that reaches no global", "    u : Pulse;", "      u(IN := 1);\n      level := u.Q;", "compiles", undefined],
+  ] as const)("a shared-global property getter that %s", (_label, members, getter, outcome, refusal) => {
+    const src = SHARED.replace(/FUNCTION_BLOCK Gauge[\s\S]*?END_FUNCTION_BLOCK/, `
+FUNCTION GF : DINT
+  VAR_INPUT i : INT; END_VAR
+  VAR_EXTERNAL G_S : DINT; END_VAR
+  GF := G_S + i;
+END_FUNCTION
+
+FUNCTION_BLOCK Reader
+  VAR_OUTPUT v : DINT; END_VAR
+  VAR_EXTERNAL G_FB : Gauge; END_VAR
+  v := G_FB.cnt;
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK Outer
+  VAR r : Reader; END_VAR
+  METHOD PUBLIC Touch : DINT
+    r();
+    Touch := r.v;
+  END_METHOD
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK Inner
+  PROPERTY PUBLIC Q : DINT
+    GET
+      Q := GF(2);
+    END_GET
+  END_PROPERTY
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK Gauge
+  VAR
+    level : DINT;
+${members}
+  END_VAR
+  VAR_OUTPUT
+    cnt : DINT;
+  END_VAR
+  PROPERTY PUBLIC P : DINT
+    GET
+${getter}
+      P := level;                                          (*@GETTER*)
+    END_GET
+  END_PROPERTY
+END_FUNCTION_BLOCK`);
+    const run = () => compile(src, { headerFileName: "generated.hpp", libraries: [IEC_STDLIB] });
+    if (outcome === "compiles") {
+      expect(run().errors.map((e) => e.message)).toEqual([]);
+    } else {
+      expect(run).toThrow(refusal!);
+    }
+  });
+
   describe.skipIf(!hasGpp || !PROBES_ON)(`two tasks against the stub host (STRUCPP_THREADED) (${PROBE_CONFIG})`, () => {
     let fBody = 0;
     let getterProbe = 0;
