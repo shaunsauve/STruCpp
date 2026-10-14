@@ -265,7 +265,17 @@ One entry per `VAR_EXTERNAL` declaration.
 
 ## `origins`
 
-Graphical-language source references (LD/FBD), referenced from `probes.origin`. Empty today.
+Graphical-language source references (LD/FBD), referenced from `probes.origin`. They come from
+the transpiler's source maps, passed as `compile({sourceOrigins})` or `strucpp --source-origins
+<file>`, one per ST file:
+
+```json
+{"file": "program.st", "origins": [{"span": [23, 3, 23, 41], "pou": "LD_Main", "kind": "rung", "id": "r0"}]}
+```
+
+Every entry is carried unchanged, in input order. A probe references the entry with the smallest
+`span` (start line, start column, end line, end column; 1-indexed, inclusive) holding its start in
+the same file, else `-1`. ST debugging ignores them. Empty when no map is given.
 
 | Field | Meaning |
 |---|---|

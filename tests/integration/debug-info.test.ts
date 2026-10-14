@@ -23,6 +23,7 @@ import { editorBuild } from "../fixtures/openplc-editor/program-build.js";
 import { compileStlib } from "../../src/library/library-compiler.js";
 import { discoverStlibs } from "../../src/node/library-loader.js";
 import {
+  DEBUG_INFO_FORMAT,
   readDebugInfo,
   serializeDebugInfo,
   type DebugInfoV1,
@@ -30,7 +31,7 @@ import {
 import type { DebugMapV2 } from "../../src/backend/debug-table-gen.js";
 import * as vendoredEditorParser from "../fixtures/openplc-editor/debug-parser.js";
 import type { StlibArchive } from "../../src/library/library-manifest.js";
-import type { LineMapEntry } from "../../src/types.js";
+import type { LineMapEntry, SourceOriginMap } from "../../src/types.js";
 
 const ROOT = path.resolve(__dirname, "../..");
 const SCHEMA_PATH = path.join(ROOT, "docs/debug-info.schema.json");
@@ -181,11 +182,19 @@ function buildCorpus(name: string): CorpusBuild[] {
       source: fs.readFileSync(path.join(dir, f), "utf8"),
     }));
     const [first, ...rest] = sources;
+    const originFile = path.join(dir, `${first!.fileName}.origin.json`);
     try {
       const r = compile(first!.source, {
         fileName: first!.fileName,
         additionalSources: rest,
         libraries,
+        ...(fs.existsSync(originFile)
+          ? {
+              sourceOrigins: [
+                JSON.parse(fs.readFileSync(originFile, "utf8")) as SourceOriginMap,
+              ],
+            }
+          : {}),
       });
       if (!r.success) {
         return {
@@ -257,6 +266,13 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
         expect(b.error, b.label).toBeUndefined();
         expect(b.info, `${b.label}: no debugInfo`).toBeDefined();
         expect(schemaErrors(serializeDebugInfo(b.info!)), b.label).toEqual([]);
+        // A022: each file's hash is the SHA-256 of its exact bytes on disk.
+        for (const f of b.info!.files) {
+          const bytes = fs.readFileSync(path.join(CORPUS_DIR, name, f.path));
+          expect(f.sha256, `${b.label} ${f.path}`).toBe(
+            createHash("sha256").update(bytes).digest("hex"),
+          );
+        }
         // A020: every linked POU is described, with statements or as no-source.
         expect(b.linkedPous, `${b.label}: no linkedPous`).toBeDefined();
         const missing = b.linkedPous!.filter((l) => {
@@ -408,12 +424,42 @@ describe.skipIf(!corpusPresent && CORPUS_ENV === undefined)(
       expect(readDebugInfo("not json").ok).toBe(false);
     });
 
-    it("keeps the largest corpus program's debug-info under 1.5 MB (A021)", () => {
+    it("loads the 50,000-leaf program's debug-info within the bound and keeps it out of the image (A021)", () => {
       const [b] = corpusBuilds("large-50k");
       expect(b!.info, "large-50k: no debugInfo").toBeDefined();
-      const bytes = new TextEncoder().encode(serializeDebugInfo(b!.info!));
-      console.info(`large-50k debug-info.json: ${bytes.length} bytes`);
-      expect(bytes.length).toBeLessThan(1_500_000);
+      expect(b!.map!.leaves.length).toBeGreaterThanOrEqual(50_000);
+      expect(b!.info!.instances.path.length).toBeGreaterThanOrEqual(200);
+      const json = serializeDebugInfo(b!.info!);
+      const bytes = new TextEncoder().encode(json).length;
+      expect(bytes).toBeLessThan(1_500_000);
+      const loads = Array.from({ length: 5 }, () => {
+        const t0 = performance.now();
+        const r = readDebugInfo(json, {
+          md5: b!.info!.build.md5,
+          buildId: b!.info!.build.buildId,
+        });
+        expect(r.ok).toBe(true);
+        return performance.now() - t0;
+      }).sort((x, y) => x - y);
+      console.info(
+        `large-50k debug-info.json: ${bytes} bytes, median load ${loads[2]!.toFixed(1)} ms`,
+      );
+      expect(loads[2]!).toBeLessThanOrEqual(2000);
+      // The statement table lives on the host: none of its text is compiled in.
+      const [first, ...rest] = b!.sources;
+      const r = compile(first!.source, {
+        fileName: first!.fileName,
+        additionalSources: rest,
+        libraries: stdLibs,
+      });
+      const image = [r.cppCode, r.headerCode, r.debugTableCpp ?? ""].join("\n");
+      for (const marker of [
+        DEBUG_INFO_FORMAT,
+        b!.info!.files[0]!.sha256,
+        JSON.stringify(b!.info!.probes.line.slice(0, 8)),
+      ]) {
+        expect(image.includes(marker), `image holds ${marker}`).toBe(false);
+      }
     });
   },
 );
@@ -850,6 +896,8 @@ interface OracleStep {
   expect?: {
     linesByFile?: Record<string, string[]>;
     pous?: Record<string, Record<string, unknown>>;
+    origins?: Array<{ pou: string; kind: string; id: string }>;
+    originOf?: Array<{ file: string; line: string; origin: string }>;
     generatedLines?: Array<{ file: string; line: string }>;
     body?: {
       breakpoints?: Array<{
@@ -915,6 +963,23 @@ function oracleDisagreements(
         if (JSON.stringify(got) !== JSON.stringify(want)) {
           bad.push(`${tag} POU ${name}: got ${JSON.stringify(got)}, oracle ${JSON.stringify(want)}`);
         }
+      }
+    }
+    if (step.inspect === "debugInfo" && ex?.origins) {
+      const got = builds.find((x) => x.ok)!.info!.origins;
+      if (JSON.stringify(got) !== JSON.stringify(ex.origins)) {
+        bad.push(`${tag} origins: got ${JSON.stringify(got)}, oracle ${JSON.stringify(ex.origins)}`);
+      }
+    }
+    for (const o of step.inspect === "debugInfo" ? (ex?.originOf ?? []) : []) {
+      const b = buildOf(o.file)!;
+      const { line, fileId } = resolve(b, o.file, o.line);
+      const info = b.info!;
+      const ids = probesOf(info)
+        .filter((p) => p.file === fileId && p.line === line)
+        .map((p) => info.origins[info.probes.origin[p.id]!]?.id ?? null);
+      if (ids.length === 0 || ids.some((id) => id !== o.origin)) {
+        bad.push(`${tag} origin of ${o.line}: got ${JSON.stringify(ids)}, oracle ${o.origin}`);
       }
     }
     if (step.inspect === "debugInfo" && ex?.generatedLines) {

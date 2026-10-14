@@ -21,7 +21,7 @@ import type {
 import type { ProjectModel } from "../project-model.js";
 import type { SymbolTables } from "../semantic/symbol-table.js";
 import type { StlibArchive } from "../library/library-manifest.js";
-import type { LinkedPou } from "../types.js";
+import type { LinkedPou, SourceOriginMap, SourceSpan } from "../types.js";
 import { isElementaryType } from "../semantic/type-registry.js";
 import { evalIntConst, MAX_TYPE_ALIAS_DEPTH } from "../semantic/type-utils.js";
 import { sha256Hex } from "./sha256.js";
@@ -334,6 +334,8 @@ export interface DebugInfoInput {
   probePlan: ProbePlan;
   /** Library functions and function blocks linked into the build. */
   linkedLibraryPous?: LinkedPou[];
+  /** Transpiler source maps; their entries become `origins`, in order. */
+  sourceOrigins?: SourceOriginMap[];
 }
 
 /** Var blocks stored in a program or FB instance; VAR_TEMP is frame storage, VAR_EXTERNAL a global. */
@@ -843,6 +845,31 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     flags: [],
     origin: [],
   };
+  const origins: DebugInfoV1["origins"] = [];
+  const originRanges: Array<{ file: string; span: SourceSpan; index: number }> =
+    [];
+  for (const map of input.sourceOrigins ?? []) {
+    for (const o of map.origins) {
+      const [startLine, startCol, endLine, endCol] = o.span;
+      originRanges.push({
+        file: map.file,
+        span: { file: map.file, startLine, startCol, endLine, endCol },
+        index: origins.length,
+      });
+      origins.push({ pou: o.pou, kind: o.kind, id: o.id });
+    }
+  }
+  const extent = (r: SourceSpan): number =>
+    (r.endLine - r.startLine) * 1_000_000 + (r.endCol - r.startCol);
+  /** Index of the smallest origin range holding `line:col`, else -1. */
+  const originAt = (file: string, line: number, col: number): number => {
+    let best: (typeof originRanges)[number] | undefined;
+    for (const r of originRanges) {
+      if (r.file !== file || !spanContains(r.span, line, col)) continue;
+      if (best === undefined || extent(r.span) < extent(best.span)) best = r;
+    }
+    return best?.index ?? -1;
+  };
   const lineSets = new Map<number, Set<number>>(
     files.map((f) => [f.id, new Set<number>()]),
   );
@@ -864,7 +891,7 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
       (r) => r.span.file === p.file && spanContains(r.span, p.line, p.col),
     );
     probes.flags.push(generated ? PROBE_FLAG_GENERATED : 0);
-    probes.origin.push(-1);
+    probes.origin.push(originAt(p.file, p.line, p.col));
     lineSets.get(file)!.add(p.line);
     pous[pou]!.entryProbe ??= id;
   });
@@ -1039,7 +1066,7 @@ export function generateDebugInfo(input: DebugInfoInput): DebugInfoV1 {
     instances,
     globals,
     externals,
-    origins: [],
+    origins,
     formats: [],
   };
 }

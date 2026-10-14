@@ -913,6 +913,7 @@ export function compile(
       md5,
       identity,
       linkedLibraryPous: linkedPous.filter((p) => p.library !== null),
+      ...(opts.sourceOrigins ? { sourceOrigins: opts.sourceOrigins } : {}),
       ...(opts.globalConstants
         ? { globalConstants: opts.globalConstants }
         : {}),
@@ -1095,6 +1096,7 @@ export type {
   LineMapEntry,
   StatementMapEntry,
   LinkedPou,
+  SourceOriginMap,
   Severity,
 } from "./types.js";
 

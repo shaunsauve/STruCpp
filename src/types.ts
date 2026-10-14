@@ -81,6 +81,13 @@ export interface CompileOptions {
   md5?: string;
 
   /**
+   * Graphical-origin source maps from an LD/FBD-to-ST transpiler, one per ST
+   * file (`<file>.origin.json`). Carried unchanged into `debug-info.json`
+   * `origins`; each probe references the smallest range holding its start.
+   */
+  sourceOrigins?: SourceOriginMap[];
+
+  /**
    * Wrap each top-level emitted declaration with
    * `//@chunk:begin/end:<kind>:<NAME>` markers in both header and cpp
    * output. The library compiler enables this so it can slice emitted
@@ -208,6 +215,18 @@ export interface LineMapEntry {
   stCol?: number;
   stEndLine?: number;
   stEndCol?: number;
+}
+
+/** `<file>.origin.json`: ST ranges of one file and the graphical element each came from. */
+export interface SourceOriginMap {
+  file: string;
+  origins: Array<{
+    /** `[startLine, startCol, endLine, endCol]`, 1-indexed, inclusive. */
+    span: [number, number, number, number];
+    pou: string;
+    kind: "rung" | "element" | "block";
+    id: string;
+  }>;
 }
 
 export interface LinkedPou {

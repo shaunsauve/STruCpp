@@ -72,7 +72,11 @@ import {
   findRuntimeIncludeDir,
   findBundledLibsDir,
 } from "./build-utils.js";
-import type { CompileError, CompileOptions } from "../types.js";
+import type {
+  CompileError,
+  CompileOptions,
+  SourceOriginMap,
+} from "../types.js";
 import { importCodesysLibraryFromBytes } from "../library/codesys-import/index.js";
 
 interface CLIOptions {
@@ -81,6 +85,8 @@ interface CLIOptions {
   debugArtifacts?: string;
   /** Program identity served on 0x45; default MD5 over the sources. */
   md5?: string;
+  /** `<file>.origin.json` transpiler source maps (repeatable). */
+  sourceOrigins: string[];
   output?: string;
   debug: boolean;
   lineMapping: boolean;
@@ -154,6 +160,7 @@ function toDiagnostic(err: {
 function parseArgs(args: string[]): CLIOptions {
   const options: CLIOptions = {
     inputs: [],
+    sourceOrigins: [],
     debug: false,
     lineMapping: true,
     lineDirectives: false,
@@ -259,6 +266,12 @@ function parseArgs(args: string[]): CLIOptions {
       if (nextArg !== undefined) {
         options.debugArtifacts = nextArg;
       }
+    } else if (arg === "--source-origins") {
+      i++;
+      const nextArg = args[i];
+      if (nextArg !== undefined) {
+        options.sourceOrigins.push(nextArg);
+      }
     } else if (arg === "--md5") {
       i++;
       const nextArg = args[i];
@@ -350,6 +363,8 @@ Options:
   -D, --define NAME=VALUE   Define a global constant (repeatable)
   --debug-artifacts <dir>   Write generated_debug.cpp, debug-map.json,
                             debug-info.json and defines.h to <dir>
+  --source-origins <file>   LD/FBD transpiler source map (<file>.origin.json),
+                            carried into debug-info.json origins (repeatable)
   --md5 <hex>               Program MD5 for debug info and defines.h
                             (default: MD5 over the input files in order)
   -v, --version             Show version
@@ -1098,6 +1113,18 @@ async function main(): Promise<void> {
   }
   if (options.md5 !== undefined) {
     compileOptions.md5 = options.md5;
+  }
+  if (options.sourceOrigins.length > 0) {
+    try {
+      compileOptions.sourceOrigins = options.sourceOrigins.map(
+        (f) => JSON.parse(readFileSync(resolve(f), "utf-8")) as SourceOriginMap,
+      );
+    } catch (e) {
+      console.error(
+        `Error: Cannot read source origins: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      process.exit(1);
+    }
   }
 
   const fileLabel =
