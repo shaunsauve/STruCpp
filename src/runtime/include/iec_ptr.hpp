@@ -332,8 +332,8 @@ T* iec_addr_xor(T* p, M mask) noexcept {
  * The mask spelling ST actually produces for a variable: an IECVar, unwrapped.
  *
  * Unwraps rather than letting IECVar's implicit `operator T()` do it, for the
- * same reason the pointer comparison operators above take `IECVar<U>` by
- * const-ref and call `.get()` (line 236ff): the conversion is not available to
+ * same reason the pointer comparison operators above take an `IECVar<U>`
+ * parameter and call `.get()` (line 236ff): the conversion is not available to
  * template argument deduction, so the parameter has to name the wrapper. It also
  * keeps forcing semantics in one place — `get()` honours a forced value, which is
  * what a debugger-forced mask should XOR in.
