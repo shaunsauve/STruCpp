@@ -4663,15 +4663,69 @@ export class CodeGenerator {
   };
 
   /**
+   * Strip redundant parentheses from an expression node.
+   *
+   * The AST keeps a `ParenthesizedExpression` node for every pair of parens the
+   * source had, so a match that looks only at `kind` misses `(ADR(x)) XOR 16#0` —
+   * an ST spelling that means exactly what `ADR(x) XOR 16#0` means, and one a
+   * program written by a code generator will contain for free.
+   */
+  private stripParens(expr: Expression): Expression {
+    let current = expr;
+    while (current.kind === "ParenthesizedExpression") {
+      current = current.expression;
+    }
+    return current;
+  }
+
+  /**
+   * Match an `ADR(v) XOR mask` chain, collecting its masks.
+   *
+   * Returns the ADR() call at the head of the left spine plus every mask hanging
+   * off it, or null when this is not that operation. ST's XOR is left-associative,
+   * so `ADR(x) XOR 16#1 XOR 16#2` arrives as a tree whose left spine is
+   * `XOR(XOR(ADR(x), 16#1), 16#2)`; only the head is an ADR call, and the masks
+   * have to be gathered to be folded. Parentheses are transparent, and the spine
+   * may be any depth.
+   *
+   * Anything else on the spine — an `AND`, a call, a plain variable — ends the
+   * match and returns null, which is what keeps `a AND b XOR c` and
+   * `m XOR ADR(x)` emitting the bitwise `^` they always did.
+   */
+  private matchAdrXorChain(
+    expr: BinaryExpression,
+  ): { adr: FunctionCallExpression; masks: Expression[] } | null {
+    // The outermost XOR's own right operand is the last mask; the spine supplies
+    // the ones to its left, innermost first once unshifted back into order.
+    const masks: Expression[] = [expr.right];
+    let current: Expression = this.stripParens(expr.left);
+    for (;;) {
+      if (current.kind === "BinaryExpression" && current.operator === "XOR") {
+        masks.unshift(current.right);
+        current = this.stripParens(current.left);
+        continue;
+      }
+      if (
+        current.kind === "FunctionCallExpression" &&
+        current.functionName.toUpperCase() === "ADR"
+      ) {
+        return { adr: current, masks };
+      }
+      return null;
+    }
+  }
+
+  /**
    * Generate C++ for a binary expression.
    */
   private generateBinaryExpression(expr: BinaryExpression): string {
-    const left = this.generateExpression(expr.left);
-    const right = this.generateExpression(expr.right);
-
+    // Each branch renders its own operands rather than rendering both up front:
+    // the ADR-XOR match below walks into the left spine and renders pieces of it
+    // itself, and rendering an expression twice is not free — an operand that
+    // registers a probe or emits a declaration would be registered twice.
     // Power operator needs special handling
     if (expr.operator === "**") {
-      return `std::pow(static_cast<double>(${left}), static_cast<double>(${right}))`;
+      return `std::pow(static_cast<double>(${this.generateExpression(expr.left)}), static_cast<double>(${this.generateExpression(expr.right)}))`;
     }
 
     const cppOp = CodeGenerator.BINARY_OP_MAP[expr.operator] ?? expr.operator;
@@ -4693,19 +4747,34 @@ export class CodeGenerator {
       // `operator^(T*, M)` is ill-formed because [over.oper] wants at least
       // one class-or-enum parameter. iec_addr_xor is a plain function template,
       // which is unconstrained that way, and returns the same typed pointer
-      // with those address bits flipped. Restricted to ADR() on the left so
-      // every other XOR keeps emitting the bitwise `^` it always did.
-      if (
-        expr.operator === "XOR" &&
-        expr.left.kind === "FunctionCallExpression" &&
-        expr.left.functionName.toUpperCase() === "ADR"
-      ) {
-        return `iec_addr_xor(${left}, ${right})`;
+      // with those address bits flipped. Restricted to an ADR() at the head of
+      // the left spine so every other XOR keeps emitting the bitwise `^` it
+      // always did — notably `m XOR ADR(v)`, which is not address math at all
+      // but a value XOR (see iec_addr_xor's doc comment for the named gaps).
+      if (expr.operator === "XOR") {
+        const chain = this.matchAdrXorChain(expr);
+        if (chain) {
+          const addr = this.generateExpression(chain.adr);
+          // One mask, however many the ST spelled. XOR is associative on address
+          // bits, so `ADR(x) XOR 16#1 XOR 16#2` — which ST parses
+          // left-associatively as `(ADR(x) XOR 16#1) XOR 16#2` — is the same
+          // address as `ADR(x) XOR (16#1 XOR 16#2)`. Folding is what keeps the
+          // chain out of `(&x ^ m1) ^ m2`, which is a raw pointer against an
+          // integer: the inexpressible spelling again, one operator deeper.
+          const masks = chain.masks.map((m) => this.generateExpression(m));
+          // A single mask keeps the exact spelling codegen emitted before the
+          // fold existed, so a program that already compiled emits the same C++.
+          const mask =
+            masks.length === 1
+              ? masks[0]!
+              : masks.map((m) => `(${m})`).join(" ^ ");
+          return `iec_addr_xor(${addr}, ${mask})`;
+        }
       }
-      return `(${left}) ${cppOp} (${right})`;
+      return `(${this.generateExpression(expr.left)}) ${cppOp} (${this.generateExpression(expr.right)})`;
     }
 
-    return `${left} ${cppOp} ${right}`;
+    return `${this.generateExpression(expr.left)} ${cppOp} ${this.generateExpression(expr.right)}`;
   }
 
   /**

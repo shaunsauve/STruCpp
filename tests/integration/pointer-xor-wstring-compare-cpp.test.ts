@@ -30,6 +30,15 @@
  * The type families are asserted rather than sampled. An operator that worked for
  * IEC_DINT and not IEC_BOOL would have been reported as a defect again later, so
  * each test sweeps the whole family it claims to cover.
+ *
+ * Which brings the second round of the same story, and the reason this header is
+ * worth re-reading: the first fix swept the POINTEE family and assumed the MASK
+ * family, so every literal mask compiled and every variable mask (`ADR(v) XOR m`)
+ * did not — the same defect one axis over. Both axes are swept now, along with
+ * the ST spellings that never reached the operator at all: a left-associative
+ * mask chain, and parentheses around the ADR(). The mask spelling the operator
+ * deliberately does NOT take, `m XOR ADR(v)`, is pinned as such rather than
+ * quietly reinterpreted — that is a value XOR, not address math.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
@@ -128,11 +137,12 @@ END_PROGRAM${CFG}`;
 
   /**
    * Every elementary type whose ADR() the front end will accept on the left of
-   * an XOR. STRING/WSTRING/TIME/DATE are absent because the type checker infers
-   * `ADR(x) XOR <literal>` as BOOL and then refuses to assign that — see the
-   * next test, which pins that gap rather than leaving it invisible. The
-   * runtime operator covers them all regardless; the test after this one proves
-   * it at the level the operator actually lives at.
+   * an XOR. STRING/WSTRING/TIME/DATE are absent because the analyzer refuses to
+   * assign *anything* into a `POINTER TO` one of them — see "what the analyzer
+   * does with a POINTER TO" below, which pins that gap with its real cause
+   * rather than leaving a wrong story attached to it. The runtime operator
+   * covers them all regardless; the test after the sweeps proves it at the level
+   * the operator actually lives at.
    */
   const TYPES: ReadonlyArray<[string, string]> = [
     ["DINT", "42"],
@@ -170,12 +180,121 @@ END_PROGRAM${CFG}`;
     },
   );
 
-  it("covers every runtime variable type, including the four the front end refuses", () => {
-    // The operator is a template over the pointee, so the claim is about the
-    // whole runtime, not about the eleven types above. This drives
-    // iec_addr_xor directly against one variable of every element type the
-    // runtime carries — scalars, both string kinds, and the duration/date
-    // types — so "works for DINT, not BOOL" cannot recur unnoticed.
+  /**
+   * The mask family, swept separately from the pointee family above.
+   *
+   * A literal mask arrives at `iec_addr_xor` as a raw `int`/`uint64_t`, but an ST
+   * *variable* mask arrives as an `IECVar<T>` — and `std::is_integral<M>` does
+   * not hold for `IECVar<T>` however integral `T` is, so template deduction
+   * found nothing and every `ADR(v) XOR m` with a variable mask was rejected by
+   * g++ while the literal spelling was fine. That is the half-fix: one axis of
+   * the operator's signature was swept, the other was assumed. Every integral
+   * IEC type is in here so an overload that worked for LWORD and not for SINT
+   * cannot recur.
+   */
+  const MASK_TYPES: ReadonlyArray<[string, string]> = [
+    ["SINT", "16#20"],
+    ["INT", "16#20"],
+    ["DINT", "16#20"],
+    ["LINT", "16#20"],
+    ["BYTE", "16#20"],
+    ["WORD", "16#20"],
+    ["DWORD", "16#20"],
+    ["LWORD", "16#20"],
+    ["USINT", "16#20"],
+    ["UINT", "16#20"],
+    ["UDINT", "16#20"],
+    ["ULINT", "16#20"],
+  ];
+
+  it.each(MASK_TYPES)(
+    "compiles and runs ADR(v) XOR m with m a %s variable",
+    (maskType, maskValue) => {
+      // The mask is non-zero and asserted against the live address, so this
+      // proves the mask was read and folded into the address — not merely that
+      // something compiled. 16#20 needs no bit of the address cleared first: XOR
+      // is exact, so `base ^ mask` is the expected pointer whatever `base` is.
+      const src = program(
+        `    x : DINT := 1;`,
+        `    px : POINTER TO DINT;
+    m : ${maskType} := ${maskValue};`,
+        `  px := ADR(x) XOR m;`,
+      );
+      const out = run(
+        src,
+        `  g_config.INSTANCE0.run();
+  uintptr_t base = reinterpret_cast<uintptr_t>(&g_config.INSTANCE0.X);
+  expect_true("${maskType} mask folded into the address",
+             g_config.INSTANCE0.PX.to_addr() == (base ^ uintptr_t(0x20)));`,
+        `addr_xor_mask_${maskType.toLowerCase()}`,
+      );
+      expect(out).toBe("ALL_OK");
+    },
+  );
+
+  /**
+   * The chain and parenthesis shapes, swept as pairs of ST spelling and the
+   * address the ST means.
+   *
+   * XOR is left-associative, so `ADR(x) XOR 16#1 XOR 16#2` is
+   * `(ADR(x) XOR 16#1) XOR 16#2` — an XOR whose *left* operand is already an
+   * address XOR, and the emitted `(... ^ mask) ^ mask` is a raw pointer against
+   * an integer, which no operator can express. The masks fold instead, which is
+   * the same value: XOR is associative on address bits.
+   */
+  it.each([
+    ["ADR(x) XOR 16#1 XOR 16#2", 0x3],
+    ["ADR(x) XOR 16#1 XOR 16#2 XOR 16#4 XOR 16#8", 0xf],
+    ["((ADR(x)) XOR 16#1) XOR 16#2", 0x3],
+    ["(ADR(x)) XOR (16#1 XOR 16#2)", 0x3],
+  ])("compiles and runs %s", (expr, mask) => {
+    const src = program(
+      `    x : DINT := 1;`,
+      `    px : POINTER TO DINT;`,
+      `  px := ${expr};`,
+    );
+    const out = run(
+      src,
+      `  g_config.INSTANCE0.run();
+  uintptr_t base = reinterpret_cast<uintptr_t>(&g_config.INSTANCE0.X);
+  expect_true("chain folds to one address XOR",
+             g_config.INSTANCE0.PX.to_addr() == (base ^ uintptr_t(${mask})));`,
+      `addr_xor_chain_${mask.toString(16)}`,
+    );
+    expect(out).toBe("ALL_OK");
+  });
+
+  it("leaves the mask spelling alone: ADR on the right is not address math", () => {
+    // `m XOR ADR(x)` is NOT the CODESYS idiom and is deliberately not folded
+    // into one: it xors the *value* of m with the *address value* of x, which is
+    // a number, not a pointer. It is also a shape that does not compile through
+    // to C++ — the emitted `M ^ (&X)` is an IECVar against a raw pointer, and
+    // the same [over.oper] rule that keeps `(&v) ^ mask` inexpressible applies
+    // here too. That gap is named in iec_addr_xor's doc comment rather than
+    // quietly reinterpreted, and this test pins the deliberate half of it: the
+    // narrowing stays narrow, so no iec_addr_xor call is emitted.
+    const result = compile(
+      program(
+        `    x : DINT := 1;
+    m : LWORD := 16#20;`,
+        `    o : LWORD;`,
+        `  o := m XOR ADR(x);`,
+      ),
+      { headerFileName: "generated.hpp" },
+    );
+    expect(result.errors.map((e) => e.message)).toEqual([]);
+    // A value xor, so the plain bitwise `^` is emitted — no iec_addr_xor call.
+    expect(result.cppCode).not.toContain("iec_addr_xor");
+  });
+
+  it("covers every runtime variable type and every integral mask type", () => {
+    // The operator is a template over the pointee AND over the mask, so the
+    // claim is about the whole runtime, not about the eleven types above. This
+    // drives iec_addr_xor directly against one variable of every element type
+    // the runtime carries — scalars, both string kinds, and the duration/date
+    // types — so "works for DINT, not BOOL" cannot recur unnoticed, and then
+    // against every spelling a mask actually arrives in: a raw integer, an
+    // IECVar of each width and signedness, and __XWORD itself.
     const out = run(
       program(
         `    n : DINT := 0;`,
@@ -214,30 +333,146 @@ END_PROGRAM${CFG}`;
   expect_true("round trip restores IEC_DINT",
               iec_addr_xor(iec_addr_xor(&di, uintptr_t(1) << 1), uintptr_t(1) << 1) == &di);
   expect_true("round trip restores IEC_STRING",
-              iec_addr_xor(iec_addr_xor(&s, uintptr_t(1) << 6), uintptr_t(1) << 6) == &s);`,
+              iec_addr_xor(iec_addr_xor(&s, uintptr_t(1) << 6), uintptr_t(1) << 6) == &s);
+
+  // The mask axis. An ST variable reaches the operator as an IECVar, which is
+  // the spelling the ST-only path uses for every mask that is not a literal;
+  // an overload constrained on the raw mask type alone found nothing here.
+  IECVar<SINT_t>  ms;
+  IECVar<INT_t>   mi;
+  IECVar<DINT_t>   md;
+  IECVar<LINT_t>   ml;
+  IECVar<BYTE_t>  mu8;
+  IECVar<WORD_t>  mu16;
+  IECVar<DWORD_t> mu32;
+  IECVar<ULINT_t> mu64;
+  IECVar<BOOL_t>  mbool;
+  IEC_XWORD       mxw;
+  ms.set(0x01); mi.set(0x02); md.set(0x04); ml.set(0x08);
+  mu8.set(0x10); mu16.set(0x20); mu32.set(0x40); mu64.set(0x80);
+  mbool.set(true); mxw.set(uintptr_t(0x100));
+
+  uintptr_t base = reinterpret_cast<uintptr_t>(&di);
+  bool masks = true;
+  masks = masks && iec_addr_xor(&di, ms)    != nullptr
+                  && reinterpret_cast<uintptr_t>(iec_addr_xor(&di, ms)) == (base ^ 0x01);
+  masks = masks && reinterpret_cast<uintptr_t>(iec_addr_xor(&di, mi)) == (base ^ 0x02);
+  masks = masks && reinterpret_cast<uintptr_t>(iec_addr_xor(&di, md)) == (base ^ 0x04);
+  masks = masks && reinterpret_cast<uintptr_t>(iec_addr_xor(&di, ml)) == (base ^ 0x08);
+  masks = masks && reinterpret_cast<uintptr_t>(iec_addr_xor(&di, mu8)) == (base ^ 0x10);
+  masks = masks && reinterpret_cast<uintptr_t>(iec_addr_xor(&di, mu16)) == (base ^ 0x20);
+  masks = masks && reinterpret_cast<uintptr_t>(iec_addr_xor(&di, mu32)) == (base ^ 0x40);
+  masks = masks && reinterpret_cast<uintptr_t>(iec_addr_xor(&di, mu64)) == (base ^ 0x80);
+  // BOOL is integral, so a BOOL mask is accepted rather than rejected — and it
+  // means what it says, flipping exactly the low bit. Same as a literal 16#1.
+  masks = masks && reinterpret_cast<uintptr_t>(iec_addr_xor(&di, mbool)) == (base ^ 0x01);
+  masks = masks && reinterpret_cast<uintptr_t>(iec_addr_xor(&di, mxw)) == (base ^ 0x100);
+  expect_true("every integral mask type XORs", masks);
+  // An IECVar mask round-trips through the same operator.
+  expect_true("IECVar mask round trip",
+              iec_addr_xor(iec_addr_xor(&di, mu32), mu32) == &di);
+  // A masked-out mask is still a mask: value 0 leaves the address alone, so the
+  // two spellings agree.
+  IECVar<DWORD_t> zero;
+  zero.set(0);
+  expect_true("zero mask leaves the address alone",
+              iec_addr_xor(&di, zero) == &di);`,
       "addr_xor_all_types",
     );
     expect(out).toBe("ALL_OK");
   });
 
-  it("records that the front end still refuses ADR(x) XOR mask on four types", () => {
-    // Pinned so the gap stays visible instead of quietly narrowing the claim
-    // above. This is a semantic-analyzer limitation, upstream of any operator:
-    // it infers `ADR(x) XOR <literal>` as BOOL and then refuses to assign BOOL
-    // to the destination. Nothing about it is fixed by the runtime work — the
-    // ST is rejected before any C++ exists — so it is recorded, not fixed here.
-    const result = compile(
-      program(
-        `    x : STRING := 'text';`,
-        `    px : POINTER TO STRING;`,
-        `  px := ADR(x) XOR 16#0;`,
-      ),
-      { headerFileName: "generated.hpp" },
+  it("reads what the analyzer does with a POINTER TO, which is: nothing", () => {
+    // Finding 2's correction. The comment this test used to carry claimed the
+    // analyzer "infers ADR(x) XOR <literal> as BOOL and refuses POINTER TO
+    // STRING/WSTRING/TIME/DATE". Measured on this tree, that is wrong twice over
+    // and the assertion it backed (`toEqual(["Cannot assign BOOL to STRING"])`)
+    // was pinning the wrong half as if it were the specification.
+    //
+    // What is actually true:
+    //
+    //  - The analyzer does not type a `POINTER TO X` as a pointer at all.
+    //    `inferVariableType` resolves the variable to the *pointee's* name, so
+    //    `px : POINTER TO DINT` is a plain DINT to it and `px : POINTER TO
+    //    STRING` is a sizeBits-0 placeholder elementary named STRING. There is no
+    //    pointer assignability check anywhere on this path.
+    //  - So the acceptance of `POINTER TO DINT := b` (a BOOL) is not leniency
+    //    about pointers, it is the ordinary BOOL→DINT widening applied to a
+    //    scalar. It is a real hole — `PX = b` compiles to `IEC_Ptr::operator=`
+    //    and lands the address 1 — but it is the analyzer's pointer typing, not
+    //    anything to do with ADR or XOR, and it is NOT narrowed here: doing so is
+    //    a language-semantics change (it would also have to start *allowing*
+    //    `POINTER TO STRING := ADR(x)`, which is refused today for the same
+    //    reason `POINTER TO STRING := 16#0` is).
+    //  - The BOOL in the old message is real but incidental: it is what the
+    //    binary-type table infers for `__XWORD XOR <int literal>`, and it is only
+    //    what gets *printed*. Nothing is refused *because* it is BOOL — a DINT
+    //    and a LWORD mask assign into `POINTER TO DINT` through the same path.
+    //  - The four refused types are refused because their names are in neither
+    //    ELEMENTARY_TYPES nor the widening table, so the placeholder never
+    //    matches and never widens. It has nothing to do with the XOR: plain
+    //    `px := ADR(x)` is refused identically, one message word apart.
+    const acc = (vars: string, ptrs: string, body: string) =>
+      compile(program(vars, ptrs, body), {
+        headerFileName: "generated.hpp",
+      }).errors.map((e) => e.message);
+
+    // The hole, pinned rather than hidden: a BOOL is assignable into a
+    // POINTER TO DINT, because the analyzer never sees a pointer.
+    expect(
+      acc(`    b : BOOL := TRUE;`, `    px : POINTER TO DINT;`, `  px := b;`),
+    ).toEqual([]);
+    expect(acc(``, `    px : POINTER TO DINT;`, `  px := TRUE;`)).toEqual([]);
+
+    // The inference the old comment described, isolated from any pointer: it is
+    // BOOL, and BOOL is what lands in the message — no more than that.
+    expect(
+      acc(`    x : DINT := 1;`, `    o : DINT;`, `  o := ADR(x) XOR 16#0;`),
+    ).toEqual([]);
+
+    // And the placeholder rule, with no XOR and no pointer in sight: a
+    // STRING-literal's type is the same placeholder name, so it is accepted,
+    // while an INT is not.
+    expect(acc(``, `    px : POINTER TO STRING;`, `  px := 'lit';`)).toEqual(
+      [],
     );
-    expect(result.errors.map((e) => e.message)).toEqual([
-      "Cannot assign BOOL to STRING",
+    expect(acc(``, `    px : POINTER TO STRING;`, `  px := 16#0;`)).toEqual([
+      "Cannot assign INT to STRING",
     ]);
   });
+
+  it.each(["STRING", "WSTRING", "TIME", "DATE"])(
+    "refuses POINTER TO %s with or without the XOR, which is the point",
+    (type) => {
+      // Same program twice, once with `ADR(x)` alone and once with the XOR. If
+      // the XOR were the cause the first would compile. It does not, and the
+      // only difference between the two messages is the inferred type of the
+      // right-hand side — __XWORD for a bare ADR(), BOOL for the XOR.
+      const bare = compile(
+        program(
+          `    x : ${type};`,
+          `    px : POINTER TO ${type};`,
+          `  px := ADR(x);`,
+        ),
+        { headerFileName: "generated.hpp" },
+      );
+      expect(bare.errors.map((e) => e.message)).toEqual([
+        `Cannot assign __XWORD to ${type}`,
+      ]);
+
+      const xored = compile(
+        program(
+          `    x : ${type};`,
+          `    px : POINTER TO ${type};`,
+          `  px := ADR(x) XOR 16#0;`,
+        ),
+        { headerFileName: "generated.hpp" },
+      );
+      expect(xored.errors.map((e) => e.message)).toEqual([
+        `Cannot assign BOOL to ${type}`,
+      ]);
+    },
+  );
 
   it("sets the address bits and reads back through the pointed-at variable", () => {
     // The mask is derived from the live address rather than hard-coded, so the

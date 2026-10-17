@@ -288,14 +288,59 @@ IEC_Ptr<T> operator+(std::ptrdiff_t n, IEC_Ptr<T> p) noexcept { return p + n; }
  *
  * Templated over T so it covers every variable the runtime hands out — each
  * IECVar<T> scalar, a STRING or WSTRING var, an array, a struct, an FB — rather
- * than only the type it was first reported against. The mask is constrained to
- * an integral type, which leaves the built-in `^` on IEC values resolving
- * exactly as before (see iec_var.hpp) and keeps `p ^ q` on two pointers an error
- * rather than silently promoting one.
+ * than only the type it was first reported against.
+ *
+ * The mask has TWO spellings, because ST has two. A literal mask arrives as a
+ * raw integer; an ST *variable* mask arrives as an `IECVar<U>`, which is a class
+ * type and so never satisfies `std::is_integral<M>` however integral `U` is —
+ * template argument deduction does not consider a user-defined conversion, and
+ * IECVar's is one. Without the overload below, `ADR(v) XOR m` compiled for every
+ * literal mask and for no variable mask at all, which is the same half-fix in a
+ * different place: the pointee family was swept, the mask family assumed. Both
+ * overloads are constrained to an integral type, which leaves the built-in `^`
+ * on IEC values resolving exactly as before (see iec_var.hpp) and keeps
+ * `p ^ q` on two pointers an error rather than silently promoting one. A BOOL
+ * mask is accepted, because BOOL is integral and means exactly what it says —
+ * the low address bit — the same as the literal `16#1`.
+ *
+ * NOT handled, and named here rather than silently absorbed elsewhere:
+ *
+ *  - A non-integral mask (`ADR(v) XOR r` with `r` a REAL). Address bits are not
+ *    a real number and folding one in would mean inventing a rounding rule. The
+ *    analyzer accepts that ST, so it reaches g++ and is rejected there.
+ *  - `m XOR ADR(v)`, mask on the LEFT. That is not this operation at all: it
+ *    xors the value of `m` with the address value of `v`, a number rather than a
+ *    pointer, so it is left as the value XOR the analyzer says it is (and, like
+ *    the naive `(&v) ^ mask`, it does not reach compilable C++ — the same
+ *    [over.oper] rule above applies in reverse).
+ *  - A `POINTER TO STRING/WSTRING/TIME/DATE` destination. The operator covers
+ *    those pointees — proven at the operator level in
+ *    tests/integration/pointer-xor-wstring-compare-cpp.test.ts — but the
+ *    analyzer refuses to assign into such a pointer at all, a bare
+ *    `px := ADR(x)` included, so the ST never reaches this function. That is the
+ *    analyzer's POINTER typing, not this signature: it resolves the variable to
+ *    the *pointee's* type name, so a `POINTER TO DINT` is checked as a plain
+ *    DINT and a `POINTER TO STRING` as a placeholder that nothing widens into.
+ *    Changing that is a language-semantics decision, not a header fix.
  */
 template<typename T, typename M, std::enable_if_t<std::is_integral<M>::value, int> = 0>
 T* iec_addr_xor(T* p, M mask) noexcept {
     return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(p) ^ static_cast<std::uintptr_t>(mask));
+}
+
+/**
+ * The mask spelling ST actually produces for a variable: an IECVar, unwrapped.
+ *
+ * Unwraps rather than letting IECVar's implicit `operator T()` do it, for the
+ * same reason the pointer comparison operators above take `IECVar<U>` by
+ * const-ref and call `.get()` (line 236ff): the conversion is not available to
+ * template argument deduction, so the parameter has to name the wrapper. It also
+ * keeps forcing semantics in one place — `get()` honours a forced value, which is
+ * what a debugger-forced mask should XOR in.
+ */
+template<typename T, typename U, std::enable_if_t<std::is_integral<U>::value, int> = 0>
+T* iec_addr_xor(T* p, const IECVar<U>& mask) noexcept {
+    return iec_addr_xor(p, static_cast<std::uintptr_t>(mask.get()));
 }
 
 } // namespace strucpp
