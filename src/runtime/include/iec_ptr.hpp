@@ -217,6 +217,17 @@ public:
     template<typename U>
     bool operator>=(IEC_Ptr<U> other) const noexcept { return ptr_ >= other.get_void(); }
 
+    // Address-bit XOR on a POINTER TO: `p := p XOR 16#7FFF000000000000`.
+    //
+    // The typed-pointer spelling of iec_addr_xor below. It IS expressible as an
+    // operator here because the left operand is an IEC_Ptr, i.e. a class object,
+    // so member lookup reaches it; the bare-pointer spelling that codegen emits
+    // for ADR() could not be. Keeping both means a pointer XOR reads the same
+    // whichever spelling produced the pointer.
+    IEC_Ptr operator^(std::uintptr_t mask) const noexcept {
+        return IEC_Ptr(reinterpret_cast<std::uintptr_t>(ptr_) ^ mask);
+    }
+
     // Comparison with nullptr
     bool operator==(std::nullptr_t) const noexcept { return ptr_ == nullptr; }
     bool operator!=(std::nullptr_t) const noexcept { return ptr_ != nullptr; }
@@ -257,5 +268,34 @@ bool operator!=(std::nullptr_t, IEC_Ptr<T> p) noexcept { return p != nullptr; }
 // Arithmetic: n + ptr (reverse order)
 template<typename T>
 IEC_Ptr<T> operator+(std::ptrdiff_t n, IEC_Ptr<T> p) noexcept { return p + n; }
+
+/**
+ * Address-bit XOR on a pointer: `p := ADR(v) XOR 16#7FFF000000000000`.
+ *
+ * CODESYS-style address math, and the only way ST can name an address that is
+ * guaranteed not to be the one it started from — which is how a fault-injection
+ * corpus builds a deliberately-dangling POINTER TO. The result is the same typed
+ * pointer with those address bits flipped, so `p^` still reads it as a T.
+ *
+ * This is a FUNCTION, and the spelling matters: `(&v) ^ mask` cannot be made to
+ * compile by any operator this runtime could define. C++ applies member-operator
+ * lookup only to a left operand that IS a class object, never through a pointer
+ * to one, so no member of the pointee is reachable from `(&v)`; and a free
+ * `operator^(T*, M)` is ill-formed outright, because [over.oper] requires every
+ * overloaded operator function to take at least one parameter of class or
+ * enumeration type, and both of those operands are a pointer and an integer.
+ * A function template is unconstrained that way, so codegen emits this call.
+ *
+ * Templated over T so it covers every variable the runtime hands out — each
+ * IECVar<T> scalar, a STRING or WSTRING var, an array, a struct, an FB — rather
+ * than only the type it was first reported against. The mask is constrained to
+ * an integral type, which leaves the built-in `^` on IEC values resolving
+ * exactly as before (see iec_var.hpp) and keeps `p ^ q` on two pointers an error
+ * rather than silently promoting one.
+ */
+template<typename T, typename M, std::enable_if_t<std::is_integral<M>::value, int> = 0>
+T* iec_addr_xor(T* p, M mask) noexcept {
+    return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(p) ^ static_cast<std::uintptr_t>(mask));
+}
 
 } // namespace strucpp

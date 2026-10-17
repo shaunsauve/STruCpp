@@ -20,6 +20,12 @@
 
 namespace strucpp {
 
+// Forward declare IECVar for the IECVar<IECWString<N>> comparison overloads
+// below. Same reason as iec_ptr.hpp's declaration: they are function templates,
+// so IECVar only has to be COMPLETE when a body is instantiated, and the
+// include graph this header deliberately sits in stays as it is.
+template<typename T> class IECVar;
+
 template<size_t MaxLen = 254>
 class IECWString {
 public:
@@ -485,6 +491,114 @@ using WSTRING_VAR = IECWStringVar<254>;
 // Non-template alias for codegen: IEC_WSTRING = IECWStringVar<254>
 // For parameterized WSTRING(N), codegen emits IECWStringVar<N> directly
 using IEC_WSTRING = IECWStringVar<254>;
+
+// Comparison operators between IECWString and IECWStringVar
+// (template deduction doesn't use implicit conversions)
+// Mirror of the STRING family in iec_string.hpp, which this file's proxy block
+// above already cites as the reason comparison operators are not members.
+//
+// IECWStringVar has `operator value_type()`, so these look reachable — but
+// template argument deduction never considers a user-defined conversion, so
+// every cross-class pair found NO candidate at all. Comparing a WSTRING to a
+// literal or to another WSTRING is the ordinary IEC idiom (`IF r_ws <> "" THEN`,
+// the exact line the retain-200 corpus program is built on), so this was a gap
+// in an everyday shape rather than an exotic one.
+template<size_t Len1, size_t Len2>
+inline bool operator==(const IECWString<Len1>& a, const IECWStringVar<Len2>& b) noexcept {
+    return a == b.get();
+}
+
+template<size_t Len1, size_t Len2>
+inline bool operator==(const IECWStringVar<Len1>& a, const IECWString<Len2>& b) noexcept {
+    return a.get() == b;
+}
+
+template<size_t Len1, size_t Len2>
+inline bool operator==(const IECWStringVar<Len1>& a, const IECWStringVar<Len2>& b) noexcept {
+    return a.get() == b.get();
+}
+
+template<size_t Len1, size_t Len2>
+inline bool operator!=(const IECWString<Len1>& a, const IECWStringVar<Len2>& b) noexcept {
+    return !(a == b);
+}
+
+template<size_t Len1, size_t Len2>
+inline bool operator!=(const IECWStringVar<Len1>& a, const IECWString<Len2>& b) noexcept {
+    return !(a == b);
+}
+
+template<size_t Len1, size_t Len2>
+inline bool operator!=(const IECWStringVar<Len1>& a, const IECWStringVar<Len2>& b) noexcept {
+    return !(a == b);
+}
+
+// Comparison operators for IECVar<IECWString<N>> (struct field access returns
+// this type). Same reasoning as the STRING family: deduction will not chain
+// through IECVar::operator T() to an IECWString comparison.
+template<size_t Len1, size_t Len2>
+inline bool operator==(const IECVar<IECWString<Len1>>& a, const IECWStringVar<Len2>& b) noexcept {
+    return static_cast<IECWString<Len1>>(a) == b.get();
+}
+template<size_t Len1, size_t Len2>
+inline bool operator==(const IECWStringVar<Len1>& a, const IECVar<IECWString<Len2>>& b) noexcept {
+    return a.get() == static_cast<IECWString<Len2>>(b);
+}
+template<size_t Len1, size_t Len2>
+inline bool operator!=(const IECVar<IECWString<Len1>>& a, const IECWStringVar<Len2>& b) noexcept {
+    return !(a == b);
+}
+template<size_t Len1, size_t Len2>
+inline bool operator!=(const IECWStringVar<Len1>& a, const IECVar<IECWString<Len2>>& b) noexcept {
+    return !(a == b);
+}
+
+// Comparison with a char16_t literal — `ws <> ""`, both operand orders.
+template<size_t MaxLen>
+inline bool operator==(const IECWStringVar<MaxLen>& a, const char16_t* b) noexcept {
+    return a.get() == b;
+}
+
+template<size_t MaxLen>
+inline bool operator==(const char16_t* a, const IECWStringVar<MaxLen>& b) noexcept {
+    return b.get() == a;
+}
+
+template<size_t MaxLen>
+inline bool operator!=(const IECWStringVar<MaxLen>& a, const char16_t* b) noexcept {
+    return !(a == b);
+}
+
+template<size_t MaxLen>
+inline bool operator!=(const char16_t* a, const IECWStringVar<MaxLen>& b) noexcept {
+    return !(a == b);
+}
+
+// Ordering operators for IECWStringVar (mirror of iec_string.hpp's)
+template<size_t Len1, size_t Len2>
+inline bool operator<(const IECWStringVar<Len1>& a, const IECWStringVar<Len2>& b) noexcept {
+    return a.get() < b.get();
+}
+template<size_t Len1, size_t Len2>
+inline bool operator<(const IECWString<Len1>& a, const IECWStringVar<Len2>& b) noexcept {
+    return a < b.get();
+}
+template<size_t Len1, size_t Len2>
+inline bool operator<(const IECWStringVar<Len1>& a, const IECWString<Len2>& b) noexcept {
+    return a.get() < b;
+}
+template<size_t Len1, size_t Len2>
+inline bool operator>(const IECWStringVar<Len1>& a, const IECWStringVar<Len2>& b) noexcept {
+    return b < a;
+}
+template<size_t Len1, size_t Len2>
+inline bool operator>(const IECWString<Len1>& a, const IECWStringVar<Len2>& b) noexcept {
+    return b < a;
+}
+template<size_t Len1, size_t Len2>
+inline bool operator>(const IECWStringVar<Len1>& a, const IECWString<Len2>& b) noexcept {
+    return b < a;
+}
 
 template<size_t MaxLen>
 inline size_t WLEN(const IECWString<MaxLen>& s) noexcept {

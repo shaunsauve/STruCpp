@@ -4685,6 +4685,23 @@ export class CodeGenerator {
       expr.operator === "OR" ||
       expr.operator === "XOR"
     ) {
+      // `p := ADR(v) XOR 16#7FFF000000000000` — CODESYS address math on a
+      // POINTER TO, and the only way ST can name an address it did not start
+      // from. ADR() becomes `&(v)`, so the naive translation is `(&v) ^ mask`,
+      // and C++ cannot express that at all: member-operator lookup does not
+      // pass through a pointer to reach the pointee, and a free
+      // `operator^(T*, M)` is ill-formed because [over.oper] wants at least
+      // one class-or-enum parameter. iec_addr_xor is a plain function template,
+      // which is unconstrained that way, and returns the same typed pointer
+      // with those address bits flipped. Restricted to ADR() on the left so
+      // every other XOR keeps emitting the bitwise `^` it always did.
+      if (
+        expr.operator === "XOR" &&
+        expr.left.kind === "FunctionCallExpression" &&
+        expr.left.functionName.toUpperCase() === "ADR"
+      ) {
+        return `iec_addr_xor(${left}, ${right})`;
+      }
       return `(${left}) ${cppOp} (${right})`;
     }
 
