@@ -303,6 +303,14 @@ IEC_Ptr<T> operator+(std::ptrdiff_t n, IEC_Ptr<T> p) noexcept { return p + n; }
  * mask is accepted, because BOOL is integral and means exactly what it says —
  * the low address bit — the same as the literal `16#1`.
  *
+ *  A SIGNED mask is read as a signed mask, which is the only reading that is
+ *  right: an address is a 64-bit __XWORD, and the one
+ *  `static_cast<std::uintptr_t>` in each of the two overloads sign-extends a
+ *  narrow signed mask — `M` in the literal spelling, `U` in the variable one —
+ *  so `m : SINT := -1` folds in every bit and yields `~base`, and the literal
+ *  `ADR(v) XOR -1` yields the same. Both spellings get it from that one cast
+ *  each, so they cannot drift apart.
+ *
  * NOT handled, and named here rather than silently absorbed elsewhere:
  *
  *  - A non-integral mask (`ADR(v) XOR r` with `r` a REAL). Address bits are not
@@ -313,15 +321,65 @@ IEC_Ptr<T> operator+(std::ptrdiff_t n, IEC_Ptr<T> p) noexcept { return p + n; }
  *    pointer, so it is left as the value XOR the analyzer says it is (and, like
  *    the naive `(&v) ^ mask`, it does not reach compilable C++ — the same
  *    [over.oper] rule above applies in reverse).
- *  - A `POINTER TO STRING/WSTRING/TIME/DATE` destination. The operator covers
- *    those pointees — proven at the operator level in
- *    tests/integration/pointer-xor-wstring-compare-cpp.test.ts — but the
- *    analyzer refuses to assign into such a pointer at all, a bare
- *    `px := ADR(x)` included, so the ST never reaches this function. That is the
- *    analyzer's POINTER typing, not this signature: it resolves the variable to
- *    the *pointee's* type name, so a `POINTER TO DINT` is checked as a plain
- *    DINT and a `POINTER TO STRING` as a placeholder that nothing widens into.
- *    Changing that is a language-semantics decision, not a header fix.
+ *  - An `ADR()` on the RIGHT of a mask: `ADR(x) XOR ADR(y)`, and its mirrored
+ *    `ADR(x) XOR 16#1 XOR ADR(y)`. This is the gap above taken the other way
+ *    round, and the chain walker does not name it: `matchAdrXorChain` walks the
+ *    left spine collecting masks without asking what KIND of expression each one
+ *    is, so an ADR on the right is collected as a mask and folded:
+ *      px := ADR(x) XOR ADR(y);           ->  PX = iec_addr_xor(&(X), &(Y));
+ *      px := ADR(x) XOR 16#1 XOR ADR(y); ->  PX = iec_addr_xor(&(X), (0x1) ^ (&(Y)));
+ *    Neither reaches compilable C++, and neither is a wrong address: the first
+ *    is "no matching function for call to 'iec_addr_xor'" (a mask that is a
+ *    pointer satisfies neither `is_integral` nor the `IECVar<U>` parameter), the
+ *    second is "invalid operands to binary expression" on the fold itself (`int`
+ *    against `IECVar<int>*`). Not a regression either — before the mask fold
+ *    existed (f28564a) this tree emitted `(iec_addr_xor(&(X), 0x1)) ^ (&(Y))`
+ *    and g++ rejected that too, for the same reason.
+ *  - A `POINTER TO STRING/WSTRING/TIME/DATE` destination is refused by the
+ *    analyzer — but NOT because it is a pointer. Read at the clause, the refusal
+ *    is the ordinary ANY_BIT -> ANY_STRING/ANY_DATE mismatch, and a program with
+ *    no pointer anywhere reports it verbatim:
+ *      s : STRING := ADR(x);              ->  Cannot assign __XWORD to STRING
+ *      px : POINTER TO STRING := ADR(x); ->  Cannot assign __XWORD to STRING
+ *    Those four names ARE elementary types: rows in ELEMENTARY_TYPES
+ *    (`src/semantic/type-utils.ts:64-77`, projected from IEC_BASE_TYPES), and
+ *    they carry ANY_STRING/ANY_DATE in TYPE_CATEGORIES (`:118-123`). The clause
+ *    they are missing is WIDENING_CATEGORY (`:130-151`), which
+ *    `isImplicitlyConvertible` reads for the far side twice — once in the
+ *    __XWORD free-conversion rule (`:341-343`) and once under the
+ *    `!tCat -> return false` guard (`:348-352`) — so a name with no widening row
+ *    can neither be converted to nor widen into anything, and validateAssignment
+ *    (`src/semantic/type-checker.ts:1061`) reports the plain elementary
+ *    mismatch. It has nothing to do with `POINTER TO`.
+ *
+ *    So the claim this comment used to make — that the analyzer refuses to
+ *    assign *anything* into a `POINTER TO` one of those four, a bare
+ *    `px := ADR(x)` included, and that a `POINTER TO STRING` is "a placeholder
+ *    that nothing widens into" — is false, and so is the conclusion drawn from
+ *    it. These compile with zero diagnostics and produce addresses:
+ *      px : POINTER TO TIME   := T#1s;        ->  []  ->  PX = 1000000000LL;
+ *      px : POINTER TO DATE   := D#2020-01-01; ->  []  ->  PX = 18262LL;
+ *      px : POINTER TO STRING := 'lit';        ->  []  ->  PX = "lit";
+ *    The operator covers all four pointees regardless, proven at the operator
+ *    level in tests/integration/pointer-xor-wstring-compare-cpp.test.ts.
+ *
+ *  - WHAT IS ACTUALLY WRONG ON THIS PATH, named and deliberately NOT fixed here:
+ *    a `POINTER TO X` declaration is never seen as a pointer. `analyzer.ts:756`
+ *    resolves the symbol from `decl.type.name` alone, so the declaration's
+ *    `referenceKind: "pointer_to"` is dropped and the variable carries the
+ *    *pointee's* plain elementary type into validateAssignment. Assignment is
+ *    then checked as if the target were a scalar of the pointee's type, so
+ *    anything assignable to that type is assignable into the pointer and
+ *    nothing about it is a pointer check. `POINTER TO DINT := b` (a BOOL)
+ *    compiles for that reason and lands address 1; the dangerous instance is the
+ *    `POINTER TO TIME := T#1s` above, which is not an address at all — it is the
+ *    duration 1000000000 ns, and it lands as address 1000000000. Both are real
+ *    defects, and both are reachable with no XOR and no address arithmetic, so
+ *    they belong to the analyzer's pointer typing rather than to this signature.
+ *    Narrowing them is a language-semantics change: it would have to start
+ *    ALLOWING `POINTER TO STRING := ADR(x)` as well as refusing
+ *    `POINTER TO STRING := 16#0`, which is the same clause above. Left to that
+ *    decision, not to a header fix.
  */
 template<typename T, typename M, std::enable_if_t<std::is_integral<M>::value, int> = 0>
 T* iec_addr_xor(T* p, M mask) noexcept {

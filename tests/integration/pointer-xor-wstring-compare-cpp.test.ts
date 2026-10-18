@@ -137,12 +137,17 @@ END_PROGRAM${CFG}`;
 
   /**
    * Every elementary type whose ADR() the front end will accept on the left of
-   * an XOR. STRING/WSTRING/TIME/DATE are absent because the analyzer refuses to
-   * assign *anything* into a `POINTER TO` one of them — see "what the analyzer
-   * does with a POINTER TO" below, which pins that gap with its real cause
-   * rather than leaving a wrong story attached to it. The runtime operator
-   * covers them all regardless; the test after the sweeps proves it at the level
-   * the operator actually lives at.
+   * an XOR. STRING/WSTRING/TIME/DATE are absent for a reason that has nothing
+   * to do with `POINTER TO`: `Cannot assign __XWORD to STRING` is the ordinary
+   * ANY_BIT -> ANY_STRING mismatch, and a program with no pointer anywhere
+   * (`s : STRING := ADR(x)`) reports it verbatim. The clause is
+   * WIDENING_CATEGORY (src/semantic/type-utils.ts:130-151) — those four names
+   * ARE in ELEMENTARY_TYPES (`:64-77`, projected from IEC_BASE_TYPES) and carry
+   * ANY_STRING/ANY_DATE in TYPE_CATEGORIES (`:118-123`), but with no widening row
+   * `isImplicitlyConvertible` returns false in both directions. So these rows
+   * pin what ST can actually reach, which is not all of it. The runtime operator
+   * covers every one of them regardless; the test after the sweeps proves that at
+   * the level the operator actually lives at.
    */
   const TYPES: ReadonlyArray<[string, string]> = [
     ["DINT", "42"],
@@ -229,6 +234,78 @@ END_PROGRAM${CFG}`;
         `addr_xor_mask_${maskType.toLowerCase()}`,
       );
       expect(out).toBe("ALL_OK");
+    },
+  );
+
+  /**
+   * The SIGN axis of the mask family, which every sweep above assumes.
+   *
+   * `MASK_TYPES` uses `16#20` for all twelve types and the raw-C++ sweep only
+   * ever sets positive values, so every mask axis in this file was swept on one
+   * side of zero and the other side was assumed. That is the same shape as the
+   * pointee/mask half-fix this whole file exists to close, one axis over again:
+   * a regression in sign handling would turn nothing red.
+   *
+   * There is a reading to get wrong here, and getting it wrong is not a
+   * neutral slip. An address is a 64-bit `__XWORD`, and a signed mask is a
+   * number of that width too, so `m : SINT := -1` must fold in every bit of the
+   * address (`~base`) rather than the low 8. Both overloads get it right from
+   * the one `static_cast<std::uintptr_t>` per overload, which sign-extends a
+   * narrow signed `U` — so the literal spelling and the variable spelling agree,
+   * and one negative value per SIGNED mask type is enough to pin it. Unsigned
+   * types are deliberately absent: `WIDENING_CATEGORY` gives them nothing to
+   * sign-extend, so a negative literal is already refused as a range error and
+   * there is no second spelling of the same question to ask.
+   *
+   * The expected mask is written as the full 64-bit literal for each row rather
+   * than computed, because the computation is the thing under test: -3 as an
+   * SINT is `0xFFFFFFFFFFFFFFFD`, not `0xFD`.
+   */
+  const NEGATIVE_MASK_TYPES: ReadonlyArray<[string, string, string]> = [
+    ["SINT", "-3", "0xFFFFFFFFFFFFFFFDULL"],
+    ["INT", "-5", "0xFFFFFFFFFFFFFFFBULL"],
+    ["DINT", "-7", "0xFFFFFFFFFFFFFFF9ULL"],
+    ["LINT", "-11", "0xFFFFFFFFFFFFFFF5ULL"],
+  ];
+
+  it.each(NEGATIVE_MASK_TYPES)(
+    "sign-extends a negative %s mask to 64 bits, both spellings",
+    (maskType, maskValue, mask64) => {
+      // The variable spelling: an ST mask arrives as an IECVar, so this row is
+      // the `IECVar<U>` overload with U narrow and signed.
+      const src = program(
+        `    x : DINT := 1;`,
+        `    px : POINTER TO DINT;
+    m : ${maskType} := ${maskValue};`,
+        `  px := ADR(x) XOR m;`,
+      );
+      const out = run(
+        src,
+        `  g_config.INSTANCE0.run();
+  uintptr_t base = reinterpret_cast<uintptr_t>(&g_config.INSTANCE0.X);
+  uintptr_t mask = uintptr_t(${mask64});
+  expect_true("${maskType} ${maskValue} sign-extends to 64 bits",
+             g_config.INSTANCE0.PX.to_addr() == (base ^ mask));`,
+        `addr_xor_negmask_${maskType.toLowerCase()}`,
+      );
+      expect(out).toBe("ALL_OK");
+
+      // The literal spelling: codegen passes the ST literal through as a C++ `int`
+      // literal, so this row is the unconstrained-M overload, and it has to read
+      // the same number. One sign regression in the shared cast, four red rows.
+      const litOut = run(
+        program(
+          `    x : DINT := 1;`,
+          `    px : POINTER TO DINT;`,
+          `  px := ADR(x) XOR ${maskValue};`,
+        ),
+        `  g_config.INSTANCE0.run();
+  uintptr_t base = reinterpret_cast<uintptr_t>(&g_config.INSTANCE0.X);
+  expect_true("literal ${maskValue} folds like the ${maskType} variable",
+             g_config.INSTANCE0.PX.to_addr() == (base ^ uintptr_t(${mask64})));`,
+        `addr_xor_negmask_lit_${maskType.toLowerCase()}`,
+      );
+      expect(litOut).toBe("ALL_OK");
     },
   );
 
@@ -392,9 +469,11 @@ END_PROGRAM${CFG}`;
     // What is actually true:
     //
     //  - The analyzer does not type a `POINTER TO X` as a pointer at all.
-    //    `inferVariableType` resolves the variable to the *pointee's* name, so
-    //    `px : POINTER TO DINT` is a plain DINT to it and `px : POINTER TO
-    //    STRING` is a sizeBits-0 placeholder elementary named STRING. There is no
+    //    `analyzer.ts:756` resolves the symbol from `decl.type.name` alone, so
+    //    the declaration's `referenceKind: "pointer_to"` is dropped: `px :
+    //    POINTER TO DINT` is a plain DINT to it, and `px : POINTER TO STRING`
+    //    is the real ELEMENTARY_TYPES row for STRING — sizeBits 0 because
+    //    strings are variable-width, not because it is a stand-in. There is no
     //    pointer assignability check anywhere on this path.
     //  - So the acceptance of `POINTER TO DINT := b` (a BOOL) is not leniency
     //    about pointers, it is the ordinary BOOL→DINT widening applied to a
@@ -408,10 +487,18 @@ END_PROGRAM${CFG}`;
     //    binary-type table infers for `__XWORD XOR <int literal>`, and it is only
     //    what gets *printed*. Nothing is refused *because* it is BOOL — a DINT
     //    and a LWORD mask assign into `POINTER TO DINT` through the same path.
-    //  - The four refused types are refused because their names are in neither
-    //    ELEMENTARY_TYPES nor the widening table, so the placeholder never
-    //    matches and never widens. It has nothing to do with the XOR: plain
-    //    `px := ADR(x)` is refused identically, one message word apart.
+    //  - The four refused types are refused by ONE clause, and it is not
+    //    ELEMENTARY_TYPES: they are in it (`:64-77`), they carry
+    //    ANY_STRING/ANY_DATE in TYPE_CATEGORIES (`:118-123`), and
+    //    resolveNamedType's placeholder stand-in is never reached on this path
+    //    at all. What they lack is a WIDENING_CATEGORY row (`:130-151`), which
+    //    `isImplicitlyConvertible` reads for the far side twice — once in the
+    //    __XWORD free-conversion rule (`:341-343`) and once under the
+    //    `!tCat -> return false` guard (`:348-352`) — so ANY_BIT reaches neither
+    //    direction and validateAssignment (type-checker.ts:1061) reports the
+    //    elementary mismatch. It has nothing to do with the XOR, and nothing to
+    //    do with the pointer either: `s : STRING := ADR(x)`, with no pointer in
+    //    the program, is refused with the same message.
     const acc = (vars: string, ptrs: string, body: string) =>
       compile(program(vars, ptrs, body), {
         headerFileName: "generated.hpp",
@@ -430,9 +517,10 @@ END_PROGRAM${CFG}`;
       acc(`    x : DINT := 1;`, `    o : DINT;`, `  o := ADR(x) XOR 16#0;`),
     ).toEqual([]);
 
-    // And the placeholder rule, with no XOR and no pointer in sight: a
-    // STRING-literal's type is the same placeholder name, so it is accepted,
-    // while an INT is not.
+    // And the same clause with no XOR and no pointer in sight: a STRING-literal's
+    // type IS the STRING elementary, so it assigns (`tCanon === sCanon`), while
+    // an INT does not — it is ANY_BIT into a name with no widening row. Same
+    // reason, one word different.
     expect(acc(``, `    px : POINTER TO STRING;`, `  px := 'lit';`)).toEqual(
       [],
     );
@@ -441,8 +529,53 @@ END_PROGRAM${CFG}`;
     ]);
   });
 
+  it("names and pins the hole: POINTER TO TIME := T#1s stores the DURATION", () => {
+    // The one that matters, because the false premise it replaces pointed at the
+    // wrong fix. The analyzer never sees a pointer on this path (analyzer.ts:756
+    // resolves the symbol from `decl.type.name`, dropping `referenceKind`), so
+    // assignment is checked as if the target were a plain scalar of the
+    // pointee's type: anything assignable to that type is assignable into the
+    // pointer. A duration is assignable to TIME. So this compiles with zero
+    // diagnostics and emits the duration in nanoseconds into an
+    // `IEC_Ptr<IEC_TIME>` — the number 1000000000, read as an address.
+    //
+    // Named, pinned, and deliberately NOT fixed: closing it is a
+    // language-semantics change (it would also have to start ALLOWING
+    // `POINTER TO STRING := ADR(x)`, refused today by the same WIDENING_CATEGORY
+    // clause). This assertion exists so that closing it — or any other change to
+    // this path — is a deliberate, visible edit and not a silent drift.
+    const acc2 = (vars: string, ptrs: string, body: string) =>
+      compile(program(vars, ptrs, body), {
+        headerFileName: "generated.hpp",
+      }).errors.map((e) => e.message);
+
+    // The control that makes the correction above falsifiable: the SAME refusal
+    // with no pointer anywhere in the program. If `POINTER TO` were the
+    // mechanism this would compile, and the false premise this comment replaces
+    // would still be standing.
+    expect(
+      acc2(`    x : STRING;`, `    s : STRING;`, `  s := ADR(x);`),
+    ).toEqual(["Cannot assign __XWORD to STRING"]);
+
+    const result = compile(
+      program(``, `    px : POINTER TO TIME;`, `  px := T#1s;`),
+      { headerFileName: "generated.hpp" },
+    );
+    expect(result.errors.map((e) => e.message)).toEqual([]);
+    expect(result.cppCode).toContain("PX = 1000000000LL;");
+
+    // The DATE and STRING instances of the same hole, so "TIME was a one-off"
+    // cannot become the story either.
+    expect(
+      acc2(``, `    px : POINTER TO DATE;`, `  px := D#2020-01-01;`),
+    ).toEqual([]);
+    expect(acc2(``, `    px : POINTER TO STRING;`, `  px := 'lit';`)).toEqual(
+      [],
+    );
+  });
+
   it.each(["STRING", "WSTRING", "TIME", "DATE"])(
-    "refuses POINTER TO %s with or without the XOR, which is the point",
+    "refuses __XWORD into %s with or without the XOR, which is the point",
     (type) => {
       // Same program twice, once with `ADR(x)` alone and once with the XOR. If
       // the XOR were the cause the first would compile. It does not, and the
